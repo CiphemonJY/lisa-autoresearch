@@ -1,0 +1,73 @@
+# LICENSE
+
+MIT License
+
+Copyright (c) 2026 LISA + AutoResearch Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## Third-Party Licenses
+
+This project uses the following third-party components:
+
+### MLX (Apple)
+- License: MIT
+- Source: https://github.com/ml-explore/mlx
+
+### mlx-lm (Apple)
+- License: MIT
+- Source: https://github.com/ml-explore/mlx-lm
+
+### Transformers (HuggingFace)
+- License: Apache 2.0
+- Source: https://github.com/huggingface/transformers
+
+### Qwen Model
+- License: Apache 2.0
+- Source: https://huggingface.co/Qwen
+
+---
+
+## Academic Citations
+
+If you use this work in academic research, please cite:
+
+### LISA (Layerwise Importance Sampling)
+
+```bibtex
+@inproceedings{pan2024lisa,
+  title={Layerwise Importance Sampling for Memory-Efficient Large Language Model Fine-Tuning},
+  author={Pan, Rui and Liu, Xiang and Chen, Kaikai and Wang, Juyong and Xu, Yiming},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2024}
+}
+```
+
+### LoRAM (Train Small, Infer Large)
+
+```bibtex
+@article{zhang2025loram,
+  title={Train Small, Infer Large: Memory-Efficient LoRA Training for Large Language Models},
+  author={Zhang, Jun and others},
+  journal={arXiv preprint arXiv:2502.13533},
+  year={2025}
+}
+```

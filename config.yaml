@@ -1,0 +1,54 @@
+# LISA + AutoResearch Configuration
+
+# Model Settings
+model:
+  id: "mlx-community/Qwen2.5-7B-Instruct-4bit"
+  precision: "4bit"
+  memory_gb: 4.9
+
+# Training Defaults
+training:
+  learning_rate: 1e-5
+  iterations: 500
+  batch_size: 1
+  seed: 42
+
+# AutoResearch Experiments
+autoresearch:
+  experiments:
+    - name: "baseline"
+      learning_rate: 1e-5
+      iterations: 100
+      batch_size: 1
+    - name: "high_lr"
+      learning_rate: 5e-5
+      iterations: 100
+      batch_size: 1
+    - name: "low_lr"
+      learning_rate: 5e-6
+      iterations: 100
+      batch_size: 1
+    - name: "more_iters"
+      learning_rate: 1e-5
+      iterations: 200
+      batch_size: 1
+    - name: "batch_2"
+      learning_rate: 1e-5
+      iterations: 100
+      batch_size: 2
+
+# LISA Settings
+lisa:
+  bottom_layers: 5  # Always train (high importance)
+  top_layers: 5     # Always train (high importance)
+  middle_sample: 2  # Randomly sample this many middle layers
+
+# Schedule (macOS LaunchAgent)
+schedule:
+  autoresearch:
+    hour: 2
+    minute: 0
+  weekly_retrain:
+    weekday: 0  # Sunday
+    hour: 4
+    minute: 0

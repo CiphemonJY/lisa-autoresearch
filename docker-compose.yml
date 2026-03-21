@@ -1,0 +1,58 @@
+# Docker Compose for LISA+Offload
+# One-command deployment with all dependencies
+
+version: '3.8'
+
+services:
+  lisa-api:
+    build: .
+    image: lisa-offload:latest
+    container_name: lisa-offload-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./output:/app/output
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=1
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - MAX_MEMORY_GB=6.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Optional: Model downloader service
+  model-downloader:
+    image: python:3.11-slim
+    container_name: lisa-model-downloader
+    volumes:
+      - ./models:/models
+    command: >
+      bash -c "
+        pip install huggingface_hub &&
+        python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct', local_dir='/models/Qwen2.5-7B-Instruct')\"
+      "
+    profiles:
+      - download
+
+  # Optional: Training monitor
+  monitor:
+    image: grafana/grafana:latest
+    container_name: lisa-monitor
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    profiles:
+      - monitor
+
+volumes:
+  grafana-storage:

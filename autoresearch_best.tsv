@@ -1,0 +1,2 @@
+date	config	learning_rate	iters	batch_size	val_loss
+2026-03-19	more_iters	1e-5	200	1	0.129

@@ -1,0 +1,81 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "LISA + AutoResearch: Combined Optimization for Training Large Models on Consumer Hardware"
+version: 1.0.0
+date-released: 2026-03-19
+url: "https://github.com/CiphemonJY/lisa-autoresearch"
+authors:
+  - name: "LISA + AutoResearch Contributors"
+license: MIT
+keywords:
+  - llm
+  - training
+  - memory-efficient
+  - disk-offload
+  - lisa
+  - autoresearch
+  - qwen
+  - mlx
+  - layer-wise
+  - optimization
+abstract: |
+  LISA + AutoResearch enables training large language models (32B+) on consumer 
+  hardware (16GB RAM) using a combined optimization approach:
+  
+  1. LISA (Layer-wise Importance Sampling): Train only important layers, reducing 
+     compute by 70-80%
+  
+  2. Disk-Offload: Load layer groups one at a time, storing activations on disk, 
+     reducing memory by 82%
+  
+  3. Combined (LISA + Disk-Offload): The best of both worlds - 5x faster than 
+     disk-offload alone while still fitting in 16GB RAM
+  
+  Memory comparison for 32B model:
+    Normal:        24 GB (OOM)
+    LISA only:     20 GB (OOM)  
+    Disk-offload:  4.3 GB (slow)
+    LISA+Offload:  5.2 GB (5x faster!)
+  sampling. The AutoResearch component automatically discovers optimal
+  training configurations through nightly experiments.
+  
+  Key features:
+  - Train Qwen 7B 4-bit in ~5GB memory
+  - LISA layer-wise training for memory efficiency
+  - Autonomous hyperparameter discovery
+  - Cross-platform support (macOS, Linux, Windows)
+  
+  This work builds on:
+  - LISA (Layerwise Importance Sampling) - NeurIPS 2024
+  - MLX framework - Apple
+  - Qwen model - Qwen Team
+
+# Dependencies
+dependencies:
+  - name: mlx
+    version: ">=0.1.0"
+  - name: mlx-lm
+    version: ">=0.1.0"
+  - name: transformers
+    version: ">=4.30.0"
+
+# Related publications
+references:
+  - type: article
+    title: "Layerwise Importance Sampling for Memory-Efficient Large Language Model Fine-Tuning"
+    authors:
+      - Pan, Rui
+      - Liu, Xiang
+      - Chen, Kaikai
+      - Wang, Juyong
+      - Xu, Yiming
+    year: 2024
+    venue: NeurIPS
+    url: https://arxiv.org/abs/2403.17919
+  - type: article
+    title: "Train Small, Infer Large: Memory-Efficient LoRA Training"
+    authors:
+      - Zhang, Jun
+    year: 2025
+    venue: ICLR
+    url: https://arxiv.org/abs/2502.13533

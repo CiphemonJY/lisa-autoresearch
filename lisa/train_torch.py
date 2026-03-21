@@ -304,22 +304,17 @@ class LISALayerTrainer:
                 logger.info(f"Loading model: {model_id}")
                 config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
 
-                # Cap for CPU efficiency
-                config.hidden_size = min(config.hidden_size, 512)
-                config.num_attention_heads = min(config.num_attention_heads, 8)
-                config.num_hidden_layers = min(config.num_hidden_layers, 6)
-
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_id,
                     config=config,
                     trust_remote_code=True,
                     torch_dtype=torch.float32,
-                    ignore_mismatched_sizes=True,
                 )
 
                 self.num_layers = config.num_hidden_layers
                 logger.info(f"Model loaded: {self.num_layers} layers, "
-                           f"hidden_size={config.hidden_size}")
+                           f"hidden_size={config.hidden_size}, "
+                           f"total_params={sum(p.numel() for p in self.model.parameters()):,}")
 
                 return True
 

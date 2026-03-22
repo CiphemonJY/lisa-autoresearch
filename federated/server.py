@@ -949,7 +949,7 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
         total_bytes = tensor.numel() * tensor.element_size()
         self.request.sendall(struct.pack("!Q", total_bytes))  # 8-byte unsigned
 
-        dtype_str = str(tensor.dtype)
+        dtype_str = str(tensor.dtype).replace("torch.", "")
         dtype_bytes = dtype_str.encode("utf-8")
         self.request.sendall(struct.pack("!I", len(dtype_bytes)) + dtype_bytes)
 

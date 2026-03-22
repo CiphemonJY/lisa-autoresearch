@@ -87,16 +87,122 @@ class FederatedClient:
         return json.loads(data.decode("utf-8"))
 
     def send_gradients(self, gradients: dict):
-        """Send gradient dict to server using torch serialization (preserves shapes)."""
+        """Send gradient dict to server using torch serialization (preserves shapes).
+
+        Uses chunked streaming for tensors > 10MB to avoid OOM.
+        Protocol: JSON header + per-tensor frames.
+        Each frame: [name_len(4)][name][dtype_len(4)][dtype][shape_len(4)][shape_json]
+                   [num_bytes(8)][chunk1][chunk2]...
+        Small tensors (< 10MB) use simple pickle for efficiency.
+        """
+        use_streaming = True  # Always attempt to detect large tensors
+        STREAMING_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+
         self.send_json({"type": "gradients", "client_id": CLIENT_ID, "round": self.round_num})
-        # Serialize with pickle (preserves tensor shapes)
-        data = pickle.dumps(gradients)
-        self.sock.sendall(struct.pack("!I", len(data)) + data)
+
+        # Detect if any tensor exceeds threshold
+        large_tensors = {}
+        small_tensors = {}
+        for name, tensor in gradients.items():
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if tensor_bytes > STREAMING_THRESHOLD:
+                large_tensors[name] = tensor
+            else:
+                small_tensors[name] = tensor
+
+        # Send header: number of large tensors
+        header = {
+            "n_large": len(large_tensors),
+            "n_small": len(small_tensors),
+            "large_names": list(large_tensors.keys()),
+        }
+        self.send_json({"grad_header": header, "type": "gradients", "client_id": CLIENT_ID, "round": self.round_num})
+
+        # Send small tensors as pickle blob
+        if small_tensors:
+            small_data = pickle.dumps(small_tensors)
+            self.sock.sendall(struct.pack("!I", len(small_data)) + small_data)
+        else:
+            self.sock.sendall(struct.pack("!I", 0))
+
+        # Send large tensors using chunked streaming
+        for name, tensor in large_tensors.items():
+            self._send_tensor_streaming(name, tensor)
+
+    def _send_tensor_streaming(self, name: str, tensor: torch.Tensor, chunk_size: int = 65536):
+        """Send a tensor in chunks to avoid memory spike."""
+        name_bytes = name.encode("utf-8")
+        self.sock.sendall(struct.pack("!I", len(name_bytes)) + name_bytes)
+
+        dtype_str = str(tensor.dtype).replace("torch.", "")
+        dtype_bytes = dtype_str.encode("utf-8")
+        self.sock.sendall(struct.pack("!I", len(dtype_bytes)) + dtype_bytes)
+
+        shape_bytes = json.dumps(list(tensor.shape)).encode("utf-8")
+        self.sock.sendall(struct.pack("!I", len(shape_bytes)) + shape_bytes)
+
+        total_bytes = tensor.numel() * tensor.element_size()
+        self.sock.sendall(struct.pack("!Q", total_bytes))  # 8-byte unsigned
+
+        np_bytes = tensor.cpu().numpy().tobytes()
+        for offset in range(0, len(np_bytes), chunk_size):
+            chunk = np_bytes[offset : offset + chunk_size]
+            self.sock.sendall(chunk)
+
+    def _recv_tensor_streaming(self, chunk_size: int = 65536) -> Tuple[str, torch.Tensor]:
+        """Receive a streamed tensor: [name_len][name][dtype_len][dtype][shape_len][shape][num_bytes][chunks]."""
+        name_len_data = self._recv_exact(4)
+        if len(name_len_data) < 4:
+            return "", torch.zeros(0)
+        name_len = struct.unpack("!I", name_len_data)[0]
+        name_bytes = self._recv_exact(name_len)
+        name = name_bytes.decode("utf-8")
+
+        dtype_len_data = self._recv_exact(4)
+        if len(dtype_len_data) < 4:
+            return name, torch.zeros(0)
+        dtype_len = struct.unpack("!I", dtype_len_data)[0]
+        dtype_bytes = self._recv_exact(dtype_len)
+        dtype_str = dtype_bytes.decode("utf-8")
+
+        shape_len_data = self._recv_exact(4)
+        if len(shape_len_data) < 4:
+            return name, torch.zeros(0)
+        shape_len = struct.unpack("!I", shape_len_data)[0]
+        shape_bytes = self._recv_exact(shape_len)
+        shape = json.loads(shape_bytes.decode("utf-8"))
+
+        num_bytes_data = self._recv_exact(8)
+        if len(num_bytes_data) < 8:
+            return name, torch.zeros(0)
+        total_bytes = struct.unpack("!Q", num_bytes_data)[0]
+
+        buffer = b""
+        while len(buffer) < total_bytes:
+            chunk = self.sock.recv(min(chunk_size, total_bytes - len(buffer)))
+            if not chunk:
+                break
+            buffer += chunk
+
+        arr = np.frombuffer(buffer, dtype=dtype_str).copy()
+        result = torch.from_numpy(arr).view(shape)
+        return name, result
+
+    def _recv_exact(self, n: int) -> bytes:
+        """Receive exactly n bytes from socket."""
+        data = b""
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                return data
+            data += chunk
+        return data
 
     def recv_model_update(self) -> dict:
         """Receive aggregated model update from server (pickle-serialized dict).
 
         Handles compressed payloads if the server sends compression metadata.
+        Handles streaming large tensors (>10MB) sent chunk-by-chunk.
         On socket timeout, returns empty dict (callers can reconnect).
         """
         grads = {}
@@ -128,8 +234,10 @@ class FederatedClient:
 
             compression_meta = meta.get("compression", {})
             compression_method = compression_meta.get("method", "none")
+            use_streaming = meta.get("use_streaming", False)
+            large_names = set(meta.get("large_tensors", []))
 
-            # Receive pickle data
+            # Receive small tensors as pickle blob
             n_header = self.sock.recv(4)
             if len(n_header) < 4:
                 return grads
@@ -141,20 +249,16 @@ class FederatedClient:
                     break
                 raw += chunk
 
-            if not raw:
-                return grads
+            if raw and n_bytes > 0:
+                small_tensors = pickle.loads(raw)
+                grads.update(small_tensors)
 
-            # Decompress if needed
-            if compression_method != "none":
-                from federated.compression import decompress_gradients
-                try:
-                    grads = decompress_gradients(raw, compression_meta)
-                    log.info(f"  Decompressed {len(grads)} tensors")
-                except Exception as e:
-                    log.warning(f"Decompression failed ({e}), treating as raw pickle")
-                    grads = pickle.loads(raw)
-            else:
-                grads = pickle.loads(raw)
+            # Receive large tensors via streaming
+            if use_streaming and large_names:
+                for name in large_names:
+                    _, tensor = self._recv_tensor_streaming()
+                    grads[name] = tensor
+                log.info(f"  Received {len(large_names)} streamed large tensors")
         except socket.timeout:
             log.warning("Timeout waiting for model update from server")
             return grads

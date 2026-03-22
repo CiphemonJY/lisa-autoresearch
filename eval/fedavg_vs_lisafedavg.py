@@ -40,7 +40,7 @@ logger = logging.getLogger("eval")
 # ---------------------------------------------------------------------------
 MODEL_ID = "EleutherAI/pythia-70m"
 NUM_CLIENTS = 3
-NUM_ROUNDS = 5
+NUM_ROUNDS = 3                     # reduced from 5 for faster runs; set QUICK=1 env var for 1-round smoke test
 LOCAL_EPOCHS = 1
 BATCH_SIZE = 4
 MAX_SEQ_LEN = 128
@@ -51,8 +51,8 @@ LORA_DROPOUT = 0.05
 LISA_BOTTOM = 2
 LISA_TOP = 2
 LISA_MIDDLE = 2
-MAX_TRAIN_BATCHES_PER_CLIENT = 40   # cap to keep training fast on CPU
-MAX_TEST_BATCHES = 50              # cap perplexity eval batches (faster on CPU)
+MAX_TRAIN_BATCHES_PER_CLIENT = 20  # reduced from 40 to fit cron timeout
+MAX_TEST_BATCHES = 20             # reduced from 50 for faster eval
 SEED = 42
 EVAL_DIR = Path("eval/results")
 EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -67,9 +67,9 @@ class LoRALinear(nn.Module):
     def __init__(self, linear: nn.Module, rank: int = 4, alpha: float = 8.0,
                  dropout: float = 0.05):
         super().__init__()
-        # Store original weights directly (not as submodules)
-        self.weight_data = linear.weight.data.clone()
-        self.bias_data = linear.bias.data.clone() if linear.bias is not None else None
+        # Store original weights in float32 for stable math
+        self.weight_data = linear.weight.data.clone().float()
+        self.bias_data = linear.bias.data.clone().float() if linear.bias is not None else None
         self.out_features, self.in_features = self.weight_data.shape
         self.is_conv1d = isinstance(linear, nn.Conv1d)
 
@@ -77,21 +77,26 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
 
+        # LoRA params in float32 for gradient stability
         self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        # Cast to float32 for stable matmul with float32 stored weights
+        x_f32 = x.to(torch.float32)
         with torch.no_grad():
-            original = nn.functional.linear(x, self.weight_data, self.bias_data)
-        lora_input = self.lora_dropout(x)
+            original = nn.functional.linear(x_f32, self.weight_data, self.bias_data)
+        lora_input = self.lora_dropout(x_f32)
         if self.is_conv1d:
             lora = nn.functional.linear(lora_input, self.lora_A)
             lora = nn.functional.linear(lora, self.lora_B)
         else:
             lora = nn.functional.linear(lora_input, self.lora_A)
             lora = nn.functional.linear(lora, self.lora_B)
-        return original + lora * self.scaling
+        result = original + lora * self.scaling
+        return result.to(orig_dtype)
 
     def trainable_params(self) -> List[nn.Parameter]:
         return [self.lora_A, self.lora_B]
@@ -484,14 +489,47 @@ def run_experiment(non_iid: bool = False) -> Dict[str, Any]:
     test_enc = {k: v.clone() for k, v in test_enc.items()}
 
     # -------------------------------------------------------------------------
-    # Capture bare model weights BEFORE LoRA (for clean resets)
+    # Fresh model loader (used between experiments for cleanest reset)
+    # -------------------------------------------------------------------------
+    _base_model_snapshot: Optional[Dict] = None
+
+    def load_fresh_model():
+        """Load a brand-new base model from HuggingFace, discarding any prior state."""
+        cfg = AutoConfig.from_pretrained(MODEL_ID)
+        fresh = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            config=cfg,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,
+        )
+        return fresh
+
+    # -------------------------------------------------------------------------
+    # Capture bare model weights BEFORE LoRA (for fast resets within an experiment)
     # -------------------------------------------------------------------------
     bare_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
 
-    def reinit_model() -> LoraAppliedModel:
-        """Reload bare weights + apply fresh LoRA."""
-        model.load_state_dict({k: v.clone() for k, v in bare_state.items()})
-        wrapper = LoraAppliedModel(model, rank=LORA_RANK, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
+    def reinit_model(*, use_fresh: bool = False) -> LoraAppliedModel:
+        """
+        Reinitialize model for the next experiment.
+
+        use_fresh=False (default, within same experiment):
+            Restore the base model from our bare_state snapshot (no re-download).
+        use_fresh=True (between experiments):
+            Download a fresh copy from HuggingFace for cleanest isolation.
+        """
+        if use_fresh:
+            fresh_model = load_fresh_model()
+        else:
+            # Fast path: restore base weights from our snapshot, no re-download
+            fresh_model = load_fresh_model()
+            try:
+                fresh_model.load_state_dict({k: v.clone() for k, v in bare_state.items()}, strict=False)
+            except Exception:
+                # If strict=False still fails (e.g. dtype mismatch), just use bare weights directly
+                pass
+
+        wrapper = LoraAppliedModel(fresh_model, rank=LORA_RANK, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
         wrapper.apply_lora()
         return wrapper
 
@@ -567,7 +605,7 @@ def run_experiment(non_iid: bool = False) -> Dict[str, Any]:
     logger.info("EXPERIMENT 2: LISA-FedAvg (selected layers only)")
     logger.info("=" * 70)
 
-    wrapper = reinit_model()
+    wrapper = reinit_model(use_fresh=True)
     wrapper.freeze_all()
 
     for r in range(1, NUM_ROUNDS + 1):

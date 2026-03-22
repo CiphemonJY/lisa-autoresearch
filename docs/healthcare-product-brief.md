@@ -158,12 +158,51 @@ Hospital C (Oracle)    ─┘       (your Mac Mini)
 
 ---
 
+## Terms of Engagement
+
+### Non-Disclosure Agreement
+
+Any party reviewing this document or attending a pitch meeting agrees to the following:
+
+1. **Confidentiality** — All technical and business information disclosed during the pitch process is confidential and may not be shared with third parties without written consent.
+
+2. **No independent development** — Reviewing party agrees not to independently develop a federated learning healthcare platform using the described architecture within 24 months of receiving this disclosure.
+
+3. **No solicitation** — Reviewing party agrees not to solicit or hire the author for a period of 12 months following disclosure.
+
+4. **Governing law** — [State of Illinois / User's state]
+
+### Equity Terms
+
+In exchange for the pilot deployment and ongoing development of the LISA_FTM healthcare platform, the author requests:
+
+| Equity Tier | Stake | Vesting |
+|------------|-------|---------|
+| **Pilot phase** | 1–2% equity | cliff 6 months, then monthly over 18 months |
+| **Platform adoption** | additional 1–2% | upon 3+ hospital customers |
+| **Enterprise deal** | additional 1–3% | upon first $500K ARR milestone |
+
+**Minimum equity floor: 2%** for any commercial agreement involving the healthcare platform technology.
+
+### Cash Compensation (alternative to equity)
+
+If equity is not possible:
+
+| Phase | Cash fee |
+|-------|---------|
+| Pilot setup | $15,000 upfront |
+| Monthly support | $5,000/month for 6 months |
+| Production deployment | $50,000 setup + $10K/month |
+
+---
+
 ## Ask
 
 We are seeking:
 - **Clinical champion** at a hospital or health system who can greenlight a pilot
 - **Healthcare attorney** referral for HIPAA BAA review (budget: $1–2K)
-- **Seed investment** of $50K–$200K to fund 2–3 paid pilots and legal ($0 if self-funded)
+- **NDA signature** before any technical disclosure
+- **Equity participation** as described above — or cash alternative
 
 ---
 
@@ -173,4 +212,4 @@ We are seeking:
 [Your email]
 [LinkedIn / institutional profile]
 
-*This document contains confidential technical and business information. Do not distribute without permission.*
+*This document contains confidential technical and business information protected by prior art declaration (docs/PRIOR_ART.md) and applicable intellectual property law. Do not distribute without permission.*

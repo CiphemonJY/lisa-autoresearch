@@ -20,6 +20,9 @@ import threading
 import hashlib
 import pickle
 import logging
+import struct
+import socket
+import socketserver
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -28,6 +31,7 @@ from collections import defaultdict
 import copy
 
 import numpy as np
+import torch
 
 # Optional FastAPI
 try:
@@ -183,30 +187,42 @@ class GradientAggregator:
         """
         Aggregate gradients using FedAvg.
         
-        Updates are already compressed bytes from clients.
-        We aggregate the decompressed gradients.
+        Updates may have:
+          - gradient_data as bytes (HTTP path, compressed)
+          - gradient_data as dict (socket path, raw torch tensors)
         
         Returns: (aggregated_state_dict_bytes, stats)
         """
         if not updates:
             return None, {"status": "no_updates"}
         
-        # Decompress all gradients
-        from federated.client import GradientCompressor
-        default_config = {"compression": {"enabled": True, "sparsification_ratio": 0.05, "quantization_bits": 8, "compression_level": 6}}
-        decompressor = GradientCompressor(default_config)
-
         decompressed = []
         for u in updates:
             try:
                 data = u.get("gradient_data", b"")
-                if isinstance(data, str):
-                    import base64 as _base64
-                    data = _base64.b64decode(data)
-                if data:
-                    comp_info = u.get("compression_info", {"method": "sparse-8bit", "sparsification_ratio": 0.05})
-                    state_dict = decompressor.decompress(data, comp_info)
-                    decompressed.append((u["client_id"], u["num_samples"], state_dict))
+                
+                if isinstance(data, dict):
+                    # Socket path: gradient_data is already a dict of tensors
+                    state_dict = {}
+                    for k, v in data.items():
+                        if isinstance(v, torch.Tensor):
+                            state_dict[k] = v.cpu().float()
+                        elif isinstance(v, np.ndarray):
+                            state_dict[k] = torch.from_numpy(v).float()
+                    if state_dict:
+                        decompressed.append((u["client_id"], u.get("num_samples", 100), state_dict))
+                elif isinstance(data, (bytes, bytearray)):
+                    # HTTP path: compressed bytes
+                    from federated.client import GradientCompressor
+                    default_config = {"compression": {"enabled": True, "sparsification_ratio": 0.05, "quantization_bits": 8, "compression_level": 6}}
+                    decompressor = GradientCompressor(default_config)
+                    if isinstance(data, str):
+                        import base64 as _base64
+                        data = _base64.b64decode(data)
+                    if data:
+                        comp_info = u.get("compression_info", {"method": "sparse-8bit", "sparsification_ratio": 0.05})
+                        state_dict = decompressor.decompress(data, comp_info)
+                        decompressed.append((u["client_id"], u.get("num_samples", 100), state_dict))
             except Exception as e:
                 logger.warning(f"Failed to decompress gradient from {u.get('client_id')}: {e}")
                 continue
@@ -218,7 +234,6 @@ class GradientAggregator:
         total_samples = sum(s for _, s, _ in decompressed)
         
         # Initialize aggregated with zero tensors
-        import torch
         first_state = decompressed[0][2]
         aggregated = {}
         for key, val in first_state.items():
@@ -236,7 +251,7 @@ class GradientAggregator:
                 if key in state_dict:
                     val = state_dict[key]
                     if isinstance(val, torch.Tensor):
-                        aggregated[key] = aggregated[key] + val.cpu() * weight * rep
+                        aggregated[key] = aggregated[key] + val.float() * weight * rep
                     elif isinstance(val, np.ndarray):
                         aggregated[key] = aggregated[key] + val * weight * rep
         
@@ -381,8 +396,8 @@ class FederatedServer:
         if "gradient_data" in update and update["gradient_data"]:
             try:
                 update["gradient_data"] = _base64.b64decode(update["gradient_data"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to decode base64 gradient data from {client_id}: {e}")
 
         with self._get_lock():
             # Update client last-seen
@@ -564,6 +579,237 @@ class FederatedServer:
 
 
 # ============================================================================
+# Socket-Based Federated Server
+# ============================================================================
+
+class FederatedSocketHandler(socketserver.BaseRequestHandler):
+    """
+    Handle one client connection via raw sockets.
+    
+    Protocol (matching fed_client.py):
+      1. Client sends JSON metadata: {"type": "gradients", "client_id": "...", "round": N}
+      2. Server reads N tensor frames: [name_len(4)][name_bytes][size(4)][data]
+      3. Server aggregates gradients (FedAvg)
+      4. Server sends JSON: {"type": "update", "n_tensors": K, "round": R}
+      5. Server sends K tensor frames back
+    """
+
+    def handle(self):
+        server = self.server.server_instance
+        lock = server._get_lock()
+
+        try:
+            # --- Step 1: receive JSON metadata ---
+            header = self._recv_exact(4)
+            if not header:
+                return
+            meta_len = struct.unpack("!I", header)[0]
+            meta_bytes = self._recv_exact(meta_len)
+            if not meta_bytes:
+                return
+            meta = json.loads(meta_bytes.decode("utf-8"))
+            msg_type = meta.get("type", "")
+            client_id = meta.get("client_id", "unknown")
+            round_num = meta.get("round", 0)
+
+            logger.info(f"[{client_id}] Socket connected (round {round_num}, type={msg_type})")
+
+            if msg_type == "gradients":
+                self._handle_gradients(server, lock, client_id, round_num)
+            elif msg_type == "disconnect":
+                logger.info(f"[{client_id}] Client disconnected gracefully")
+            else:
+                logger.warning(f"[{client_id}] Unknown message type: {msg_type}")
+
+        except Exception as e:
+            logger.error(f"[{client_id}] Socket handler error: {e}")
+
+    def _recv_exact(self, n: int) -> bytes:
+        """Receive exactly n bytes."""
+        data = b""
+        while len(data) < n:
+            chunk = self.request.recv(n - len(data))
+            if not chunk:
+                return data
+            data += chunk
+        return data
+
+    def _recv_tensor(self) -> Tuple[str, torch.Tensor]:
+        """Receive one tensor: [name_len][name_bytes][size][data]."""
+        name_len_data = self._recv_exact(4)
+        if len(name_len_data) < 4:
+            return "", torch.zeros(0)
+        name_len = struct.unpack("!I", name_len_data)[0]
+        name_bytes = self._recv_exact(name_len)
+        name = name_bytes.decode("utf-8")
+
+        size_data = self._recv_exact(4)
+        if len(size_data) < 4:
+            return name, torch.zeros(0)
+        size = struct.unpack("!I", size_data)[0]
+        raw = self._recv_exact(size)
+        arr = np.frombuffer(raw, dtype=np.float32).copy()
+        return name, torch.from_numpy(arr)
+
+    def _send_tensor(self, name: str, tensor: torch.Tensor):
+        """Send one tensor: [name_len][name_bytes][size][data]."""
+        name_bytes = name.encode("utf-8")
+        self.request.sendall(struct.pack("!I", len(name_bytes)) + name_bytes)
+
+        data = tensor.cpu().numpy().tobytes()
+        self.request.sendall(struct.pack("!I", len(data)) + data)
+
+    def _handle_gradients(self, server, lock, client_id: str, round_num: int):
+        """Receive gradients, aggregate, send update back."""
+        # --- Step 2: receive number of tensors ---
+        n_header = self._recv_exact(4)
+        if len(n_header) < 4:
+            return
+        n_tensors = struct.unpack("!I", n_header)[0]
+        logger.info(f"[{client_id}] Receiving {n_tensors} gradient tensors")
+
+        # Receive tensors into a state dict
+        grad_state = {}
+        for _ in range(n_tensors):
+            name, tensor = self._recv_tensor()
+            grad_state[name] = tensor
+
+        # Register client
+        server.register_client(client_id)
+
+        # Build gradient update dict for FederatedServer.receive_gradient
+        # We store gradients as a dict (not compressed) so receive_gradient
+        # can pass them directly to the aggregator
+        import base64 as _base64
+        grad_norm = float(torch.norm(torch.cat([t.flatten() for t in grad_state.values()])).item())
+        update = {
+            "client_id": client_id,
+            "round_number": round_num,
+            "num_samples": 100,  # default; real clients may send more
+            "gradient_norm": grad_norm,
+            "gradient_data": grad_state,  # dict: will be handled specially
+        }
+
+        with lock:
+            # Validate & record
+            is_valid, reason = server.validator.validate(client_id, update)
+            server.validator.record_norm(client_id, grad_norm)
+
+            if client_id in server.clients:
+                server.clients[client_id].pending_gradient = update
+
+            if round_num not in server.round_state:
+                server.round_state[round_num] = RoundState(
+                    round_number=round_num,
+                    status="collecting",
+                    started_at=time.time(),
+                )
+
+            rs = server.round_state[round_num]
+            rs.gradients_received += 1
+            rs.gradients_accepted += 1
+            rs.clients_joined.append(client_id)
+            server.metrics.total_gradients_received += 1
+
+            if client_id in server.clients:
+                server.clients[client_id].rounds_participated += 1
+
+            logger.info(
+                f"[{client_id}] Gradient recorded (round {round_num}): "
+                f"norm={grad_norm:.4f}, tensors={len(grad_state)}"
+            )
+
+            # Check if we should aggregate
+            min_clients = server.config.get("min_clients_per_round", 2)
+            if len(set(rs.clients_joined)) >= min_clients and rs.status == "collecting":
+                self._aggregate_and_respond(server, lock, round_num)
+            else:
+                # Not enough clients yet — wait briefly then respond
+                time.sleep(0.5)
+                self._aggregate_and_respond(server, lock, round_num)
+
+    def _aggregate_and_respond(self, server, lock, round_num: int):
+        """Aggregate gradients and send model update back to this client."""
+        rs = server.round_state.get(round_num)
+        if rs is None:
+            return
+
+        # Wait for status to settle
+        timeout = 10
+        waited = 0
+        while rs.status == "collecting" and waited < timeout:
+            time.sleep(0.1)
+            waited += 0.1
+
+        # If still collecting (only 1 client), force aggregation
+        if rs.status == "collecting":
+            logger.info(f"Force-aggregating round {round_num} with {len(set(rs.clients_joined))} client(s)")
+            updates = []
+            for cid in set(rs.clients_joined):
+                if cid in server.clients and server.clients[cid].pending_gradient:
+                    updates.append(server.clients[cid].pending_gradient)
+            if updates:
+                reputations = {c.client_id: c.reputation for c in server.clients.values()}
+                aggregated, stats = server.aggregator.aggregate(updates, reputations)
+                if aggregated:
+                    server._apply_gradient(aggregated)
+                    server._save_model(round_num)
+                rs.status = "done"
+                rs.completed_at = time.time()
+                rs.aggregated_gradient = aggregated
+                for cid in server.clients:
+                    server.clients[cid].pending_gradient = None
+                server.global_round = round_num
+                server.metrics.total_rounds += 1
+
+        # Build model update response
+        if server.current_model:
+            state = pickle.loads(server.current_model)
+            # Only send lora_ parameters to reduce bandwidth
+            lora_tensors = {k: v for k, v in state.items() if "lora_" in k}
+            if not lora_tensors:
+                lora_tensors = state  # fallback: send all
+            update_tensors = lora_tensors
+        else:
+            update_tensors = {}
+
+        logger.info(f"[{self.client_address}] Sending {len(update_tensors)} tensors as model update")
+
+        # --- Step 4: send JSON metadata ---
+        response_meta = {
+            "type": "update",
+            "n_tensors": len(update_tensors),
+            "round": round_num,
+        }
+        response_bytes = json.dumps(response_meta).encode("utf-8")
+        self.request.sendall(struct.pack("!I", len(response_bytes)) + response_bytes)
+
+        # --- Step 5: send tensor frames ---
+        self.request.sendall(struct.pack("!I", len(update_tensors)))
+        for name, tensor in update_tensors.items():
+            t = tensor.float().cpu().reshape(-1)
+            self._send_tensor(name, t)
+
+        logger.info(f"[{self.client_address}] Update sent for round {round_num}")
+
+
+class FederatedSocketServer(socketserver.ThreadingTCPServer):
+    """TCP server for handling federated learning client connections."""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_instance, port: int = 8080):
+        self.server_instance = server_instance  # FederatedServer instance
+        super().__init__(("0.0.0.0", port), FederatedSocketHandler)
+        logger.info(f"Socket server listening on port {port}")
+
+    def server_close(self):
+        logger.info("Socket server shutting down")
+        super().server_close()
+
+
+# ============================================================================
 # FastAPI App
 # ============================================================================
 
@@ -719,9 +965,9 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Federated Learning Server")
-    parser.add_argument("--mode", choices=["server", "demo"], default="demo")
+    parser.add_argument("--mode", choices=["server", "demo", "socket"], default="demo")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--clients", type=int, default=3)
     parser.add_argument("--model", default=DEFAULT_CONFIG["model_name"])
@@ -742,11 +988,32 @@ def main():
         server = FederatedServer(config)
         app._server = server  # type: ignore
         
-        print(f"Starting server on {args.host}:{args.port}")
+        print(f"Starting HTTP server on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
     
+    elif args.mode == "socket":
+        # Socket-based server for fed_client.py
+        print(f"Loading model: {args.model} ...")
+        server = FederatedServer(config)
+        
+        print(f"Starting socket server on {args.host}:{args.port}")
+        socket_server = FederatedSocketServer(server, port=args.port)
+        
+        print(f"Federated socket server running on port {args.port}")
+        print(f"  Model: {args.model}")
+        print(f"  Rounds: {args.rounds}")
+        print(f"  Min clients/round: {args.min_clients}")
+        print(f"  Waiting for clients...")
+        print(f"Press Ctrl+C to stop.")
+        
+        try:
+            socket_server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            socket_server.shutdown()
+    
     else:
-        # Demo mode
+        # Demo mode (in-process, no network)
         sim = DemoFederatedSimulator(config)
         
         # Add simulated clients

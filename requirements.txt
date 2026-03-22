@@ -1,24 +1,22 @@
-# Core dependencies
-mlx>=0.15.0           # Apple Silicon ML framework (macOS only)
-mlx-lm>=0.19.0       # MLX language model utilities (macOS only)
-transformers>=4.40.0  # HuggingFace transformers
+# Core ML/AI
+torch>=2.0.0
+transformers>=4.36.0
+datasets>=2.14.0
+huggingface_hub>=0.19.0
 
-# PyTorch (required for Windows/CPU federated learning)
-torch>=2.2.0
+# Federated learning server
+fastapi>=0.104.0
+uvicorn>=0.24.0
 
-# Data processing
-numpy>=1.26.0
-pandas>=2.2.0
+# Configuration
+pyyaml>=6.0
 
-# Federated learning server (Windows/CPU)
-fastapi>=0.100.0      # HTTP API server
-uvicorn>=0.23.0       # ASGI server
+# Optional: LoRA fine-tuning
+# peft>=0.7.0
 
-# Optional but recommended
-tqdm>=4.66.0          # Progress bars
-pyyaml>=6.0           # Config files
-huggingface-hub>=0.20  # Model downloads
+# Optional: Apple Silicon
+# mlx>=0.15.0
+# mlx-lm>=0.19.0
 
-# Development
-pytest>=8.0.0          # Testing
-black>=24.0.0          # Formatting
+# Testing
+pytest>=7.4.0

@@ -1,0 +1,26 @@
+# LISA_FTM Default Configuration
+# This file is loaded automatically if it exists at config/default.yaml.
+# Use --config <path> to load a different config file.
+# CLI arguments override values in this file.
+
+model:
+  name: "EleutherAI/pythia-70m"
+  lora_rank: 4
+  lora_alpha: 8
+
+training:
+  lr: 3e-4
+  epochs: 3
+  batch_size: 4
+  seq_length: 128
+  steps: 200
+
+federated:
+  server_host: "127.0.0.1"
+  server_port: 8080
+  rounds: 3
+  local_steps: 5
+
+offload:
+  enabled: false
+  layer_groups: 4

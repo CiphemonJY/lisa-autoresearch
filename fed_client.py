@@ -77,20 +77,47 @@ class FederatedClient:
     def send_gradients(self, gradients: dict):
         """Send gradient dict to server."""
         self.send_json({"type": "gradients", "client_id": CLIENT_ID, "round": self.round_num})
-        # Send each tensor
-        for name, tensor in gradients.items():
-            if not isinstance(tensor, torch.Tensor):
-                continue
+        # Send tensor count first, then each tensor
+        tensors = [(n, t) for n, t in gradients.items() if isinstance(t, torch.Tensor)]
+        self.sock.sendall(struct.pack("!I", len(tensors)))
+        for name, tensor in tensors:
             data = tensor.cpu().numpy().tobytes()
-            header = struct.pack("!I", len(data))
             name_bytes = name.encode("utf-8")
-            name_len = struct.pack("!I", len(name_bytes))
-            self.sock.sendall(name_len + name_bytes + header + data)
+            self.sock.sendall(struct.pack("!I", len(name_bytes)) + name_bytes)
+            self.sock.sendall(struct.pack("!I", len(data)) + data)
 
     def recv_model_update(self) -> dict:
-        """Receive aggregated model update from server."""
+        """Receive aggregated model update from server.
+        
+        Server sends: JSON with n_tensors, then n_tensors count, then each tensor.
+        """
         grads = {}
-        n_tensors = self.recv_json().get("n_tensors", 0)
+        # Receive JSON header + body
+        header = self.sock.recv(4)
+        if len(header) < 4:
+            log.warning("No response header from server")
+            return grads
+        meta_len = struct.unpack("!I", header)[0]
+        meta_bytes = b""
+        while len(meta_bytes) < meta_len:
+            chunk = self.sock.recv(meta_len - len(meta_bytes))
+            if not chunk:
+                break
+            meta_bytes += chunk
+        try:
+            meta = json.loads(meta_bytes.decode("utf-8"))
+            log.info(f"  Server response: {meta}")
+        except Exception as e:
+            log.warning(f"Failed to parse server response JSON: {e}")
+            return grads
+        
+        # Receive tensor count
+        n_header = self.sock.recv(4)
+        if len(n_header) < 4:
+            return grads
+        n_tensors = struct.unpack("!I", n_header)[0]
+        log.info(f"  Receiving {n_tensors} model tensors...")
+        
         for _ in range(n_tensors):
             name_len_data = self.sock.recv(4)
             if len(name_len_data) < 4:
@@ -104,6 +131,8 @@ class FederatedClient:
             data = b""
             while len(data) < size:
                 chunk = self.sock.recv(min(65536, size - len(data)))
+                if not chunk:
+                    break
                 data += chunk
             import numpy as np
             grads[name] = torch.from_numpy(np.frombuffer(data, dtype=np.float32))
@@ -130,26 +159,23 @@ class FederatedClient:
             return False
 
     def apply_lora(self) -> int:
-        from lisa.train_torch import LoRALinear
-        import torch.nn as nn
-        count = 0
-        for full_name, module in self.model.named_modules():
-            if not isinstance(module, nn.Linear):
-                continue
-            if not any(tm in full_name.lower() for tm in ["attn", "mlp", "fc", "proj"]):
-                continue
-            lora = LoRALinear(module, rank=LORA_RANK, alpha=LORA_ALPHA,
-                              dropout=0.05, target_module_name=full_name)
-            parts = full_name.rsplit(".", 1)
-            if len(parts) == 2:
-                try:
-                    parent = self.model.get_submodule(parts[0])
-                    setattr(parent, parts[1], lora)
-                    count += 1
-                except (KeyError, AttributeError):
-                    pass
-        log.info(f"  LoRA applied to {count} layers")
+        """Apply LoRA using the LoraAppliedModel from train_torch (handles Conv1D too)."""
+        from lisa.train_torch import LoraAppliedModel, LISAConfig
+        
+        # Create a minimal config for LoRA application
+        class _Cfg:
+            lora_rank = LORA_RANK
+            lora_alpha = LORA_ALPHA
+            lora_dropout = 0.05
+            lora_target_modules = ["c_attn", "c_proj", "q_proj", "v_proj", "k_proj", "o_proj", 
+                                   "gate_proj", "up_proj", "down_proj", "fc1", "fc2"]
+        
+        cfg = _Cfg()
+        wrapper = LoraAppliedModel(self.model, cfg)
+        count = wrapper.apply_lora(target_modules=cfg.lora_target_modules)
+        wrapper.freeze_all_except_lora()
         self.lora_count = count
+        log.info(f"  LoRA applied to {count} layers")
         return count
 
     def train_local(self, texts, n_steps: int = 5) -> float:
@@ -161,6 +187,10 @@ class FederatedClient:
         if texts is None or len(texts) == 0:
             log.info("No data from server, using synthetic batch")
             texts = ["The quick brown fox jumps over the lazy dog."] * 100
+
+        # Ensure LoRA is applied (handles both first-time and reconnect)
+        if self.lora_count == 0:
+            self.apply_lora()
 
         # Tokenize
         enc = self.tokenizer(texts, truncation=True, max_length=128,
@@ -278,8 +308,8 @@ class FederatedClient:
         if self.sock:
             try:
                 self.send_json({"type": "disconnect", "client_id": CLIENT_ID})
-            except:
-                pass
+            except Exception as e:
+                log.warning(f"Failed to send disconnect message to server: {e}")
             self.sock.close()
             self.sock = None
 
@@ -300,8 +330,7 @@ def run_standalone():
     if not client.load_model():
         return
     client.apply_lora()
-    # LoRA params are applied but frozen; train_local() unfreezes them per round
-    log.info("LoRA applied. train_local() will unfreeze LoRA params per round.")
+    log.info("LoRA applied. Starting federated rounds.")
 
     # Try to connect to server
     connected = client.connect()

@@ -441,6 +441,106 @@ The key advantage of federated learning: **no single machine needs to train the 
 
 ---
 
+## 10. Running on Raspberry Pi / Jetson Nano
+
+The `client_minimal.py` script is a single-file federated client designed for memory-constrained edge devices. It implements the same gradient-exchange protocol as `fed_client.py` but uses only the core dependencies.
+
+### Hardware profiles
+
+| Device | RAM | Recommended settings |
+|--------|-----|----------------------|
+| **RPi Zero 2 W** | 512 MB | `--device cpu --batch-size 1 --local-steps 3` |
+| **Jetson Nano** | 4 GB | `--device cuda --batch-size 4 --local-steps 3` |
+| **ARM64 board** | 1–2 GB | `--device cpu --batch-size 1 --lora-rank 4` |
+
+### Requirements (minimal)
+
+```bash
+# RPi Zero 2 W / ARM64
+pip install torch transformers datasets
+
+# Jetson Nano (with CUDA)
+pip install torch transformers datasets
+# Ensure JetPack CUDA libraries are installed system-wide
+```
+
+For RAM monitoring (optional), install `psutil`:
+
+```bash
+pip install psutil
+```
+
+### Quick start
+
+**1. Connect to a federated server:**
+
+```bash
+python client_minimal.py \
+  --server 127.0.0.1:8080 \
+  --model EleutherAI/pythia-70m \
+  --device auto \
+  --local-steps 3
+```
+
+**2. With GPU (Jetson Nano):**
+
+```bash
+python client_minimal.py \
+  --server 127.0.0.1:8080 \
+  --model EleutherAI/pythia-70m \
+  --device cuda \
+  --local-steps 5 \
+  --batch-size 4
+```
+
+**3. Standalone (no server — saves gradients locally):**
+
+```bash
+python client_minimal.py \
+  --model EleutherAI/pythia-70m \
+  --local-steps 3 \
+  --rounds 3
+```
+
+### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--server` | `http://127.0.0.1:8080` | Federated server address |
+| `--model` | `EleutherAI/pythia-70m` | HuggingFace model ID |
+| `--auth-token` | (env: `LISA_AUTH_TOKEN`) | Auth token for server |
+| `--device` | `auto` | `auto`, `cpu`, or `cuda` |
+| `--local-steps` | `3` | Training steps per round |
+| `--lora-rank` | `4` | LoRA rank (memory vs quality) |
+| `--batch-size` | `4` | Training batch size |
+| `--rounds` | `3` | Number of federated rounds |
+| `--timeout` | `300` | Socket timeout (seconds) |
+
+### Memory usage
+
+`client_minimal.py` prints RAM usage at startup and every 10 training steps:
+
+```
+RAM step 0 (after model load): 420.3MB
+CUDA:      NVIDIA Jetson Nano
+VRAM:      4.0GB
+```
+
+On the RPi Zero 2 W, only LoRA adapter gradients are held in RAM — the base model weights stay on disk/CPU. The full gradient dict is never materialised alongside the model.
+
+### Jetson Nano GPU notes
+
+- `torch.cuda.is_available()` auto-detects CUDA — `--device auto` selects GPU by default
+- VRAM is logged at startup: `torch.cuda.get_device_properties(0).total_memory`
+- Gradient compression (sparsify / quantize) works identically on GPU — tensors are moved to CPU before sending
+
+### RPi Zero 2 W notes
+
+- Load only the tokenizer + config first; model params live in CPU RAM
+- LoRA rank 4 is the default (minimal trainable footprint)
+- Use `--batch-size 1` to keep peak RAM below 512 MB
+- Gradients are sent as base64-encoded pickle (same protocol as `fed_client.py`)
+
 ## Troubleshooting
 
 ### "Connection refused" when client connects

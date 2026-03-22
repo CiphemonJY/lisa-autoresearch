@@ -153,10 +153,11 @@ class FederatedClient:
         return count
 
     def train_local(self, texts, n_steps: int = 5) -> float:
-        """Train LoRA layers locally on provided texts. Returns avg loss."""
-        from datasets import load_dataset
-        from torch.utils.data import DataLoader
-
+        """
+        Train LoRA layers locally on provided texts. Returns avg loss.
+        NOTE: Does NOT call optimizer.step() — caller extracts gradients
+        for sending to federated server.
+        """
         if texts is None or len(texts) == 0:
             log.info("No data from server, using synthetic batch")
             texts = ["The quick brown fox jumps over the lazy dog."] * 100
@@ -168,7 +169,7 @@ class FederatedClient:
         attention_mask = enc["attention_mask"]
         labels = input_ids.clone()
 
-        # Freeze ALL params first, then unfreeze only LoRA params
+        # Freeze ALL params, then unfreeze only LoRA params
         for param in self.model.parameters():
             param.requires_grad = False
         for name, param in self.model.named_parameters():
@@ -176,7 +177,7 @@ class FederatedClient:
                 param.requires_grad = True
 
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        log.info(f"  Training {trainable:,} LoRA params for {n_steps} steps")
+        log.info(f"  Training {trainable:,} LoRA params for {n_steps} steps (no optimizer.step)")
 
         optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
@@ -186,10 +187,8 @@ class FederatedClient:
         self.model.train()
         losses = []
         batch_size = 4
-        n_batches = (len(texts) + batch_size - 1) // batch_size
 
         for step in range(n_steps):
-            # Sample batch
             idx = torch.randperm(len(input_ids))[:batch_size].tolist()
             ids = input_ids[idx]
             mask = attention_mask[idx]
@@ -206,23 +205,15 @@ class FederatedClient:
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], max_norm=1.0
             )
-            optimizer.step()
+            # DO NOT call optimizer.step() here - we need gradients for the server
             losses.append(loss.item())
 
             if (step + 1) % 5 == 0:
                 log.info(f"    Step {step+1}/{n_steps} | loss={loss.item():.4f}")
 
         avg_loss = sum(losses) / len(losses)
-        log.info(f"  Local training done: avg_loss={avg_loss:.4f}")
+        log.info(f"  Local training done: avg_loss={avg_loss:.4f} (gradients ready for server)")
         return avg_loss
-
-    def get_lora_gradients(self) -> dict:
-        """Extract LoRA gradient tensors for sending to server."""
-        grads = {}
-        for name, param in self.model.named_parameters():
-            if "lora_" in name and param.grad is not None:
-                grads[name] = param.grad.clone().cpu()
-        return grads
 
     def apply_gradients(self, updates: dict):
         """Apply aggregated gradient updates from server (accumulate to LoRA params)."""
@@ -243,8 +234,11 @@ class FederatedClient:
         log.info("Training locally...")
         avg_loss = self.train_local(data, n_steps=5)
 
-        # Extract gradients
-        grads = self.get_lora_gradients()
+        # Extract gradients BEFORE optimizer.step() clears them
+        grads = {}
+        for name, param in self.model.named_parameters():
+            if "lora_" in name and param.grad is not None:
+                grads[name] = param.grad.clone().cpu()
         log.info(f"  Extracted {len(grads)} gradient tensors")
 
         if self.sock is None:
@@ -306,6 +300,8 @@ def run_standalone():
     if not client.load_model():
         return
     client.apply_lora()
+    # LoRA params are applied but frozen; train_local() unfreezes them per round
+    log.info("LoRA applied. train_local() will unfreeze LoRA params per round.")
 
     # Try to connect to server
     connected = client.connect()

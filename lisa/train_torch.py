@@ -160,16 +160,6 @@ class LoRALinear(torch.nn.Module):
                 ba = (self.lora_B @ self.lora_A) * self.scaling
                 self.linear.weight.data = w + ba
 
-    def trainable_parameters(self) -> List[torch.nn.Parameter]:
-        return [self.lora_A, self.lora_B]
-
-    def merge_weights(self):
-        """Merge LoRA weights into original for inference."""
-        with torch.no_grad():
-            w = self.linear.weight.data
-            ba = self.lora_B @ self.lora_A * self.scaling
-            self.linear.weight.data = w + ba
-
 
 class LoraAppliedModel:
     """Wraps a model with LoRA applied to target layers."""

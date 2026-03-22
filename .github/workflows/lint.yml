@@ -1,0 +1,30 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Syntax check Python files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile check all Python files
+        run: |
+          echo "Running py_compile on all .py files..."
+          find . -name "*.py" -not -path "./.git/*" | while read -r f; do
+            echo "Checking: $f"
+            python -m py_compile "$f" 2>&1 && echo "  OK" || echo "  FAILED"
+          done
+          echo "Done."

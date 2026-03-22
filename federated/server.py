@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "byzantine_method": "none",  # none, krum, trimmed_mean, norm
     "byzantine_f": 1,           # max expected malicious clients (krum)
     "byzantine_alpha": 0.1,     # trim fraction for trimmed_mean
+    "use_streaming": True,      # Enable chunked transfer for large tensors (>10MB)
 }
 
 
@@ -960,12 +961,38 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             chunk = np_bytes[offset : offset + chunk_size]
             self.request.sendall(chunk)
 
-    def _recv_tensor_streaming(self, name: str, total_bytes: int, dtype_str: str,
-                                chunk_size: int = 65536) -> torch.Tensor:
+    def _recv_tensor_streaming(self, chunk_size: int = 65536) -> Tuple[str, torch.Tensor]:
         """
-        Receive a tensor in chunks without buffering full tensor until the end.
-        Accumulates into a bytes buffer, then converts to numpy/torch at the end.
+        Receive a streamed tensor from socket.
+        Protocol: [name_len(4)][name][dtype_len(4)][dtype][shape_len(4)][shape][num_bytes(8)][chunks...]
+        Returns: (name, tensor)
         """
+        name_len_data = self._recv_exact(4)
+        if len(name_len_data) < 4:
+            return "", torch.zeros(0)
+        name_len = struct.unpack("!I", name_len_data)[0]
+        name_bytes = self._recv_exact(name_len)
+        name = name_bytes.decode("utf-8")
+
+        dtype_len_data = self._recv_exact(4)
+        if len(dtype_len_data) < 4:
+            return name, torch.zeros(0)
+        dtype_len = struct.unpack("!I", dtype_len_data)[0]
+        dtype_bytes = self._recv_exact(dtype_len)
+        dtype_str = dtype_bytes.decode("utf-8")
+
+        shape_len_data = self._recv_exact(4)
+        if len(shape_len_data) < 4:
+            return name, torch.zeros(0)
+        shape_len = struct.unpack("!I", shape_len_data)[0]
+        shape_bytes = self._recv_exact(shape_len)
+        shape = json.loads(shape_bytes.decode("utf-8"))
+
+        num_bytes_data = self._recv_exact(8)
+        if len(num_bytes_data) < 8:
+            return name, torch.zeros(0)
+        total_bytes = struct.unpack("!Q", num_bytes_data)[0]
+
         buffer = b""
         while len(buffer) < total_bytes:
             chunk = self.request.recv(min(chunk_size, total_bytes - len(buffer)))
@@ -974,7 +1001,8 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             buffer += chunk
 
         arr = np.frombuffer(buffer, dtype=dtype_str).copy()
-        return torch.from_numpy(arr)
+        result = torch.from_numpy(arr).view(shape)
+        return name, result
 
     def _send_tensor(self, name: str, tensor: torch.Tensor):
         """Send one tensor: [name_len][name_bytes][size][data]."""
@@ -985,37 +1013,67 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
         self.request.sendall(struct.pack("!I", len(data)) + data)
 
     def _handle_gradients(self, server, lock, client_id: str, round_num: int):
-        """Receive gradients, aggregate, send update back."""
-        # --- Step 2: receive gradient dict (mixed: small=pickle, large=streaming) ---
-        try:
-            n_header = self._recv_exact(4)
-            if len(n_header) < 4:
-                self._mark_client_disconnected(server, lock, client_id, round_num)
-                return
-            n_bytes = struct.unpack("!I", n_header)[0]
+        """Receive gradients, aggregate, send update back.
 
-            # Check payload size; use streaming receive if > threshold
-            use_streaming = n_bytes > self.STREAMING_THRESHOLD
-            if use_streaming:
-                logger.info(f"[{client_id}] Large payload ({n_bytes/1e6:.1f} MB) - using streaming receive")
-            raw = b""
-            while len(raw) < n_bytes:
-                chunk = self.request.recv(min(65536, n_bytes - len(raw)))
-                if not chunk:
-                    break
-                raw += chunk
-            if not raw or len(raw) < n_bytes:
+        Protocol:
+          1. handle() already received JSON meta: {"type": "gradients", ...}
+          2. Client sends grad_header JSON with small/large tensor split info
+          3. Client sends small tensors as pickle blob (if any)
+          4. Client sends large tensors as streaming frames
+        """
+        # --- Receive grad_header ---
+        try:
+            gh_len_data = self._recv_exact(4)
+            if len(gh_len_data) < 4:
                 self._mark_client_disconnected(server, lock, client_id, round_num)
                 return
-            grad_state = pickle.loads(raw)
-        except (ConnectionResetError, BrokenPipeError, OSError) as e:
-            logger.warning(f"[{client_id}] Disconnected while receiving gradients: {e}")
-            self._mark_client_disconnected(server, lock, client_id, round_num)
-            return
+            gh_len = struct.unpack("!I", gh_len_data)[0]
+            gh_bytes = self._recv_exact(gh_len)
+            if len(gh_bytes) < gh_len:
+                self._mark_client_disconnected(server, lock, client_id, round_num)
+                return
+            grad_header = json.loads(gh_bytes.decode("utf-8"))
         except Exception as e:
-            logger.error(f"[{client_id}] Error receiving gradients: {e}")
+            logger.error(f"[{client_id}] Failed to receive grad_header: {e}")
             self._mark_client_disconnected(server, lock, client_id, round_num)
             return
+
+        n_large = grad_header.get("n_large", 0)
+        n_small = grad_header.get("n_small", 0)
+        large_names = set(grad_header.get("large_names", []))
+        logger.info(f"[{client_id}] Receiving gradients: {n_small} small, {n_large} large tensors")
+
+        grad_state = {}
+
+        # --- Receive small tensors as pickle blob ---
+        try:
+            small_len_data = self._recv_exact(4)
+            if len(small_len_data) < 4:
+                self._mark_client_disconnected(server, lock, client_id, round_num)
+                return
+            small_len = struct.unpack("!I", small_len_data)[0]
+            if small_len > 0:
+                small_raw = b""
+                while len(small_raw) < small_len:
+                    chunk = self.request.recv(min(65536, small_len - len(small_raw)))
+                    if not chunk:
+                        break
+                    small_raw += chunk
+                small_tensors = pickle.loads(small_raw)
+                grad_state.update(small_tensors)
+        except Exception as e:
+            logger.error(f"[{client_id}] Failed to receive small tensors: {e}")
+            self._mark_client_disconnected(server, lock, client_id, round_num)
+            return
+
+        # --- Receive large tensors via streaming ---
+        for i in range(n_large):
+            try:
+                name, tensor = self._recv_tensor_streaming()
+                grad_state[name] = tensor
+            except Exception as e:
+                logger.warning(f"[{client_id}] Failed to receive large tensor {i}: {e}")
+                break
 
         logger.info(f"[{client_id}] Received {len(grad_state)} gradient tensors (pickle)")
 
@@ -1136,6 +1194,14 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                 server.global_round = round_num
                 server.metrics.total_rounds += 1
 
+                # Memory profiling
+                try:
+                    _proc = psutil.Process()
+                    mem_mb = _proc.memory_info().rss / 1e6
+                    logger.info(f"  Peak memory: {mem_mb:.1f} MB")
+                except Exception:
+                    pass
+
             # Mark this client as completed
             if completed_client_id and completed_client_id not in rs.clients_completed:
                 rs.clients_completed.append(completed_client_id)
@@ -1183,17 +1249,39 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             response_data = pickle.dumps(update_tensors)
 
         # --- Step 4: send JSON metadata ---
+        # Detect large tensors for streaming
+        large_names = []
+        if server.config.get("use_streaming", True) and update_tensors:
+            STREAMING_THRESHOLD = 10 * 1024 * 1024
+            for name, tensor in update_tensors.items():
+                if isinstance(tensor, torch.Tensor):
+                    sz = tensor.numel() * tensor.element_size()
+                    if sz > STREAMING_THRESHOLD:
+                        large_names.append(name)
+
         response_meta = {
             "type": "update",
             "n_tensors": len(update_tensors) if update_tensors is not None else -1,
             "round": round_num,
             "compression": compression_metadata,
+            "use_streaming": bool(large_names),
+            "large_tensors": large_names,
         }
         response_bytes = json.dumps(response_meta).encode("utf-8")
         try:
             self.request.sendall(struct.pack("!I", len(response_bytes)) + response_bytes)
-            # --- Step 5: send payload (compressed or pickle-serialized) ---
-            self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
+            # --- Step 5: send payload ---
+            if compression_method != "none":
+                self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
+            elif large_names and server.config.get("use_streaming", True):
+                # Mixed: send small tensors as pickle, large tensors via streaming
+                small = {k: v for k, v in update_tensors.items() if k not in large_names}
+                small_data = pickle.dumps(small) if small else b""
+                self.request.sendall(struct.pack("!I", len(small_data)) + small_data)
+                for name in large_names:
+                    self.send_tensor_streaming(name, update_tensors[name])
+            else:
+                self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
             logger.info(f"[{self.client_address}] Update sent for round {round_num}")
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             logger.warning(f"[{self.client_address}] Client disconnected before receiving update: {e}")

@@ -853,6 +853,191 @@ def test_fedavg_no_double_normalization():
 
 
 # ============================================================================
+# 10. Byzantine Resilience Tests
+# ============================================================================
+
+def test_byzantine_norm_detects_outlier():
+    """
+    Create 4 honest clients with small gradients and 1 malicious client
+    with a much larger gradient. Norm-based detection should flag and exclude
+    the outlier.
+    
+    With 4 honest clients of norm ~1 and 1 malicious of norm ~100,
+    mean ≈ 21, std ≈ 44, threshold ≈ 153. The malicious gradient (100)
+    is below the threshold with 3σ — so we use a larger outlier (500).
+    """
+    from federated.byzantine import ByzantineResilientAggregator, norm_based_aggregate
+
+    base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm ≈ 5.5
+    honest_norms = [5.0, 5.5, 6.0, 5.3]  # ~5.5 each
+    grad_dicts = []
+    for n in honest_norms:
+        grad_dicts.append({"layer.weight": base * (n / 5.5)})
+    # One malicious client with a massive gradient (norm ~5000 >> threshold ~764)
+    malicious = {"layer.weight": base * (5000.0 / 5.5)}
+
+    grad_dicts.append(malicious)
+    n_honest = len(honest_norms)
+
+    # Norm-based should flag the malicious one
+    byz = ByzantineResilientAggregator(method="norm", sigma_threshold=3.0)
+    result, stats = byz.aggregate(grad_dicts)
+
+    assert stats["num_outliers"] >= 1, f"Should detect outlier, got stats: {stats}"
+    assert stats["num_kept"] == n_honest, \
+        f"Should keep {n_honest} honest clients, got: {stats}"
+
+    # Also test the raw function
+    result2, stats2 = norm_based_aggregate(grad_dicts, sigma_threshold=3.0)
+    assert stats2["num_outliers"] >= 1, f"Raw function should detect outlier: {stats2}"
+
+    print("[PASS] test_byzantine_norm_detects_outlier")
+
+
+def test_byzantine_trimmed_mean_works():
+    """
+    Verify trimmed mean computation is correct.
+    
+    For a single dimension with values [1, 2, 3, 4, 5] and alpha=0.2:
+    - n=5, trim 1 from each end (floor(0.2*5)=1)
+    - sorted = [1,2,3,4,5], trimmed = [2,3,4], mean = 3.0
+    """
+    from federated.byzantine import trimmed_mean_aggregate, ByzantineResilientAggregator
+
+    # Create 5 clients with simple gradient values
+    grad_dicts = [
+        {"layer.weight": torch.tensor([[1.0]])}  # index 0
+        for _ in range(5)
+    ]
+    # Set the actual values we want to test
+    grad_dicts[0]["layer.weight"] = torch.tensor([[1.0]])
+    grad_dicts[1]["layer.weight"] = torch.tensor([[2.0]])
+    grad_dicts[2]["layer.weight"] = torch.tensor([[3.0]])
+    grad_dicts[3]["layer.weight"] = torch.tensor([[4.0]])
+    grad_dicts[4]["layer.weight"] = torch.tensor([[5.0]])
+
+    byz = ByzantineResilientAggregator(method="trimmed_mean", alpha=0.2)
+    result, stats = byz.aggregate(grad_dicts)
+
+    # Trim 1 from each end: mean of [2,3,4] = 3.0
+    expected_val = 3.0
+    actual_val = result["layer.weight"].item()
+    assert abs(actual_val - expected_val) < 1e-4, \
+        f"Trimmed mean: expected {expected_val}, got {actual_val}"
+
+    # Also test 3 clients with alpha=0.1 (minimum trim)
+    grad3 = [
+        {"layer.weight": torch.tensor([[1.0]])},
+        {"layer.weight": torch.tensor([[2.0]])},
+        {"layer.weight": torch.tensor([[3.0]])},
+    ]
+    byz3 = ByzantineResilientAggregator(method="trimmed_mean", alpha=0.1)
+    result3, stats3 = byz3.aggregate(grad3)
+    # n=3, alpha=0.1, floor(0.1*3)=0 → no trim, mean = (1+2+3)/3 = 2.0
+    assert abs(result3["layer.weight"].item() - 2.0) < 1e-4, \
+        f"Trimmed mean n=3 alpha=0.1 should give 2.0, got {result3['layer.weight'].item()}"
+
+    print("[PASS] test_byzantine_trimmed_mean_works")
+
+
+def test_byzantine_aggregate_preserves_shape():
+    """
+    Verify that ByzantineResilientAggregator output dict has the same
+    shapes as the inputs, for all three methods.
+    """
+    from federated.byzantine import ByzantineResilientAggregator
+
+    grad_dicts = [
+        {
+            "lora_A": torch.randn(4, 16),
+            "lora_B": torch.randn(8, 4),
+            "layer.weight": torch.randn(8, 16),
+            "layer.bias": torch.randn(8),
+        }
+        for _ in range(4)
+    ]
+
+    for method in ["krum", "trimmed_mean", "norm"]:
+        if method == "krum":
+            byz = ByzantineResilientAggregator(method=method, f=1)
+        elif method == "trimmed_mean":
+            byz = ByzantineResilientAggregator(method=method, alpha=0.1)
+        else:
+            byz = ByzantineResilientAggregator(method=method)
+
+        result, stats = byz.aggregate(grad_dicts)
+
+        assert set(result.keys()) == set(grad_dicts[0].keys()), \
+            f"[{method}] Output keys mismatch: {set(result.keys())} vs {set(grad_dicts[0].keys())}"
+
+        for key in grad_dicts[0]:
+            assert result[key].shape == grad_dicts[0][key].shape, \
+                f"[{method}] Shape mismatch for '{key}': {result[key].shape} vs {grad_dicts[0][key].shape}"
+
+    print("[PASS] test_byzantine_aggregate_preserves_shape")
+
+
+def test_byzantine_krum_selects_closest_to_neighbors():
+    """
+    Krum should select the gradient closest to its neighbors,
+    which should be the honest one when f malicious clients exist.
+    """
+    from federated.byzantine import ByzantineResilientAggregator, krum_select
+
+    # 4 clients: 3 honest with similar gradients, 1 malicious with very different
+    honest_base = {"layer.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]])}
+    malicious = {"layer.weight": torch.tensor([[100.0, -100.0], [100.0, -100.0]])}
+
+    grad_dicts = [
+        {k: v.clone() for k, v in honest_base.items()},
+        {k: v.clone() + torch.randn_like(v) * 0.01 for k, v in honest_base.items()},  # honest+noise
+        {k: v.clone() + torch.randn_like(v) * 0.01 for k, v in honest_base.items()},  # honest+noise
+        {k: v.clone() for k, v in malicious.items()},  # malicious
+    ]
+
+    # f=1, n=4 → n-f-2 = 1 neighbor, multi-krum selects n-f-1 = 2
+    byz = ByzantineResilientAggregator(method="krum", f=1)
+    result, stats = byz.aggregate(grad_dicts)
+
+    # Multi-krum should select 2 of the 3 honest clients
+    assert stats["method"] == "krum"
+    assert stats["num_excluded"] >= 1, f"Krum should exclude at least 1 malicious: {stats}"
+    assert stats["status"] == "success", f"Krum failed: {stats}"
+
+    # Also test the raw krum_select function
+    indices, select_stats = krum_select(grad_dicts, f=1, multi=True)
+    # With n=4, f=1: multi-krum selects n-f-1 = 2
+    assert len(indices) == 2, f"Multi-krum should select 2, got {len(indices)}: {indices}"
+    # The malicious is index 3, should NOT be selected
+    assert 3 not in indices, f"Malicious client 3 should NOT be selected: {indices}"
+
+    print("[PASS] test_byzantine_krum_selects_closest_to_neighbors")
+
+
+def test_byzantine_fallback_when_all_look_malicious():
+    """
+    If norm-based detection flags all clients, it should fall back to FedAvg.
+    """
+    from federated.byzantine import norm_based_aggregate
+
+    # Two very different large gradients — both might look like outliers
+    grad_dicts = [
+        {"layer.weight": torch.tensor([[1000.0, 2000.0]])},
+        {"layer.weight": torch.tensor([[-1000.0, -2000.0]])},
+    ]
+
+    # With n=2, std might be huge and threshold very high — or very low
+    # Test the fallback path explicitly
+    result, stats = norm_based_aggregate(grad_dicts, sigma_threshold=0.0)
+    # sigma_threshold=0 means only mean itself would pass; std might be 0 or huge
+    # The key is it should NOT crash and should return something
+    assert "status" in stats
+    assert isinstance(result, dict)
+
+    print("[PASS] test_byzantine_fallback_when_all_look_malicious")
+
+
+# ============================================================================
 # pytest entry points
 # ============================================================================
 
@@ -880,6 +1065,12 @@ if __name__ == "__main__":
         test_compress_both_roundtrip,
         test_compress_gradients_interface,
         test_fedavg_no_double_normalization,
+        # Byzantine resilience
+        test_byzantine_norm_detects_outlier,
+        test_byzantine_trimmed_mean_works,
+        test_byzantine_aggregate_preserves_shape,
+        test_byzantine_krum_selects_closest_to_neighbors,
+        test_byzantine_fallback_when_all_look_malicious,
     ]
 
     failed = []

@@ -6,8 +6,9 @@ Connects to federated server, trains LoRA layers, sends gradients.
 This PC (8GB RAM, CPU-only) contributes to training a 1.1B param model
 by training locally and sharing gradients with the federation.
 """
-import os, sys, time, torch, logging, socket, json, struct, pickle
+import os, sys, time, torch, logging, socket, json, struct, pickle, argparse
 from pathlib import Path
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,10 +36,11 @@ def find_free_port():
 class FederatedClient:
     """Connect to federated server, train locally, exchange gradients."""
 
-    def __init__(self, server_host: str, server_port: int, model_id: str = MODEL_ID):
+    def __init__(self, server_host: str, server_port: int, model_id: str = MODEL_ID, auth_token: Optional[str] = None):
         self.server_host = server_host
         self.server_port = server_port
         self.model_id = model_id
+        self.auth_token = auth_token
         self.model = None
         self.tokenizer = None
         self.lora_count = 0
@@ -51,6 +53,16 @@ class FederatedClient:
             self.sock.settimeout(30)
             self.sock.connect((self.server_host, self.server_port))
             log.info(f"Connected to server at {self.server_host}:{self.server_port}")
+
+            # Send auth token first if configured
+            if self.auth_token is not None:
+                token_bytes = self.auth_token.encode("utf-8")
+                self.sock.sendall(struct.pack("!I", len(token_bytes)) + token_bytes)
+                log.info("Auth token sent to server")
+            else:
+                # Send zero-length token (server will skip auth if it has no token set)
+                self.sock.sendall(struct.pack("!I", 0))
+
             return True
         except Exception as e:
             log.warning(f"Could not connect to server: {e}")
@@ -296,6 +308,14 @@ class FederatedClient:
 
 def run_standalone():
     """Run without server - train locally, demonstrate the concept."""
+    parser = argparse.ArgumentParser(description="Federated Learning Client")
+    parser.add_argument("--host", default=SERVER_HOST)
+    parser.add_argument("--port", type=int, default=SERVER_PORT)
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--auth-token", type=str, default=None,
+                        help="Auth token for server (optional)")
+    args, unknown = parser.parse_known_args()
+
     log.info("=" * 60)
     log.info("FEDERATED LEARNING CLIENT (Standalone Demo)")
     log.info("=" * 60)
@@ -305,7 +325,7 @@ def run_standalone():
     log.info("  python -m federated.server --model TinyLlama-1.1B --port 8080")
     log.info("")
 
-    client = FederatedClient(SERVER_HOST, SERVER_PORT)
+    client = FederatedClient(args.host, args.port, args.model, auth_token=args.auth_token)
 
     if not client.load_model():
         return

@@ -23,6 +23,7 @@ import logging
 import struct
 import socket
 import socketserver
+import secrets
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ DEFAULT_CONFIG = {
     "min_clients_per_round": 2,
     "max_clients_per_round": 10,
     "round_timeout_secs": 120,
+    "round_wait_secs": 60,  # how long to wait for all clients per round
     "aggregation_method": "fedavg",  # fedavg, fedprox, trimmed_mean
     "gradient_noise_tolerance": 1e6,
     "save_model_every": 5,
@@ -97,6 +99,8 @@ class RoundState:
     round_number: int
     status: str  # waiting, collecting, aggregating, done, failed
     clients_joined: List[str] = field(default_factory=list)
+    clients_completed: List[str] = field(default_factory=list)  # clients that received their update
+    clients_disconnected: List[str] = field(default_factory=list)  # clients that dropped mid-round
     gradients_received: int = 0
     gradients_accepted: int = 0
     gradients_rejected: int = 0
@@ -597,8 +601,31 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
     def handle(self):
         server = self.server.server_instance
         lock = server._get_lock()
+        client_ip = self.client_address[0] if self.client_address else "unknown"
 
         try:
+            # --- Auth token exchange (if server has auth_token configured) ---
+            if self.server.auth_token is not None:
+                # Client sends 4-byte token length followed by token bytes
+                token_header = self._recv_exact(4)
+                if not token_header or len(token_header) < 4:
+                    logger.warning(f"[{client_ip}] Auth failed: connection closed during token read")
+                    return
+                token_len = struct.unpack("!I", token_header)[0]
+                if token_len > 1024 or token_len == 0:
+                    logger.warning(f"[{client_ip}] Auth failed: invalid token length {token_len}")
+                    return
+                token_bytes = self._recv_exact(token_len)
+                if not token_bytes or len(token_bytes) < token_len:
+                    logger.warning(f"[{client_ip}] Auth failed: incomplete token received")
+                    return
+                received_token = token_bytes.decode("utf-8", errors="replace")
+                if not secrets.compare_digest(received_token, self.server.auth_token):
+                    # Use constant-time comparison to avoid timing attacks
+                    logger.warning(f"[{client_ip}] Auth failed: invalid auth token")
+                    return
+                logger.info(f"[{client_ip}] Client authenticated successfully")
+
             # --- Step 1: receive JSON metadata ---
             header = self._recv_exact(4)
             if not header:
@@ -795,9 +822,14 @@ class FederatedSocketServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_instance, port: int = 8080):
+    def __init__(self, server_instance, port: int = 8080, auth_token: Optional[str] = None):
         self.server_instance = server_instance  # FederatedServer instance
+        self.auth_token = auth_token
         super().__init__(("0.0.0.0", port), FederatedSocketHandler)
+        if self.auth_token:
+            logger.info(f"Socket server auth token is set — client authentication enabled")
+        else:
+            logger.info(f"Socket server auth token is NOT set — clients will connect without authentication")
         logger.info(f"Socket server listening on port {port}")
 
     def server_close(self):
@@ -968,14 +1000,27 @@ def main():
     parser.add_argument("--clients", type=int, default=3)
     parser.add_argument("--model", default=DEFAULT_CONFIG["model_name"])
     parser.add_argument("--min-clients", type=int, default=2)
-    
+    parser.add_argument("--auth-token", type=str, default=None,
+                        help="Shared secret token for client authentication (optional)")
+    parser.add_argument("--round-timeout", type=int, default=60,
+                        help="Max seconds to wait for clients per round (default 60)")
+    parser.add_argument("--gen-token", action="store_true",
+                        help="Generate a random auth token and exit")
+
     args = parser.parse_args()
+
+    if args.gen_token:
+        token = secrets.token_urlsafe(32)
+        print(token)
+        sys.exit(0)
     
     config = DEFAULT_CONFIG.copy()
     config["model_name"] = args.model
     config["num_rounds"] = args.rounds
     config["min_clients_per_round"] = args.min_clients
-    
+    config["round_wait_secs"] = args.round_timeout
+    config["auth_token"] = args.auth_token
+
     if args.mode == "server":
         if not FASTAPI_AVAILABLE:
             print("Error: fastapi not installed. Install with: pip install fastapi uvicorn")
@@ -993,7 +1038,7 @@ def main():
         server = FederatedServer(config)
         
         print(f"Starting socket server on {args.host}:{args.port}")
-        socket_server = FederatedSocketServer(server, port=args.port)
+        socket_server = FederatedSocketServer(server, port=args.port, auth_token=args.auth_token)
         
         print(f"Federated socket server running on port {args.port}")
         print(f"  Model: {args.model}")

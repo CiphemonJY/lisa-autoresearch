@@ -34,20 +34,24 @@ Built on **LISA** (Layer-wise Importance Sampling): only train the layers that m
 
 ## Quick Start
 
-### 1. Start the server
+### 1. Install dependencies
 ```bash
-cd lisa-autoresearch
-python main.py --mode server --port 8080
+pip install torch transformers datasets huggingface_hub
 ```
 
-### 2. Run a client (same machine or another device)
+### 2. Start the server
 ```bash
-python fed_client.py --server 127.0.0.1 --port 8080 --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rounds 10
+python -m federated.server --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rounds 3 --port 8080
 ```
 
-### 3. Or run locally without a server (demo mode)
+### 3. Run a client (same machine or another device)
 ```bash
-python real_training.py --steps 200
+python fed_client.py --host 127.0.0.1 --port 8080
+```
+
+### Or run locally without a server
+```bash
+python main.py --mode train --model EleutherAI/pythia-70m --steps 100
 ```
 
 ---

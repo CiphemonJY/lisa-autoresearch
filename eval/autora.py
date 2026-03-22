@@ -304,11 +304,13 @@ def partition_data(texts: List[str], n: int, seed: int = 42, non_iid: bool = Fal
 
 @torch.no_grad()
 def compute_perplexity(model: torch.nn.Module, test_enc: Dict[str, torch.Tensor],
-                       batch_size: int = 4) -> float:
+                       batch_size: int = 4, max_batches: int = None) -> float:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
     n_batches = (len(test_enc["input_ids"]) + batch_size - 1) // batch_size
+    if max_batches is not None:
+        n_batches = min(n_batches, max_batches)
     for i in range(n_batches):
         start, end = i * batch_size, min((i + 1) * batch_size, len(test_enc["input_ids"]))
         ids = test_enc["input_ids"][start:end].clone()
@@ -442,7 +444,8 @@ def run_experiment(cfg: Dict[str, Any], exp_id: int) -> Dict[str, Any]:
     LORA_ALPHA = 8.0
     LORA_DROPOUT = 0.05
     BATCH_SIZE = 4
-    MAX_SEQ_LEN = 128
+    MAX_SEQ_LEN = 64
+    MAX_TEST_SAMPLES = 200
     SEED = 42
 
     logger.info("=" * 70)
@@ -489,6 +492,9 @@ def run_experiment(cfg: Dict[str, Any], exp_id: int) -> Dict[str, Any]:
 
     test_enc = tokenize_texts(tokenizer, test_texts, MAX_SEQ_LEN)
     test_enc = {k: v.clone() for k, v in test_enc.items()}
+    # Limit test samples for faster perplexity evaluation
+    for k in test_enc:
+        test_enc[k] = test_enc[k][:MAX_TEST_SAMPLES]
 
     # -------------------------------------------------------------------------
     # Apply LoRA
@@ -497,6 +503,10 @@ def run_experiment(cfg: Dict[str, Any], exp_id: int) -> Dict[str, Any]:
     lora_wrapper = LoraAppliedModel(model, rank=LORA_RANK, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
     lora_count = lora_wrapper.apply_lora()
     logger.info(f"  LoRA applied to {lora_count} layers")
+
+    # Ensure model is fully on CPU before training begins
+    model.to('cpu')
+    logger.info(f"  Model device: {next(model.parameters()).device}")
 
     # Save base (pre-LoRA) model state for resets
     base_state = {k: v.clone().cpu() for k, v in model.state_dict().items()}
@@ -576,10 +586,18 @@ def run_experiment(cfg: Dict[str, Any], exp_id: int) -> Dict[str, Any]:
             if cfg.get("COMPRESSION", "none") != "none":
                 delta = compress_gradients(delta, cfg)
 
+            # Apply differential privacy noise (Gaussian noise on gradient tensors)
+            noise_mult = cfg.get("NOISE_MULTIPLIER", 0.0)
+            if noise_mult > 0.0:
+                for key in delta:
+                    grad_std = delta[key].float().abs().mean().item()
+                    noise = torch.randn_like(delta[key]) * grad_std * noise_mult
+                    delta[key] = delta[key].float() + noise
+
             round_grad_deltas.append(delta)
 
             # Compute perplexity (on a sample of test data for speed)
-            ppl = compute_perplexity(model, test_enc)
+            ppl = compute_perplexity(model, test_enc, max_batches=50)
 
             # Count grad tensors (per selected layer: 2 tensors — lora_A and lora_B)
             n_grad_tensors = len(selected) * 2

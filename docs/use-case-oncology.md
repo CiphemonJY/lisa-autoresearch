@@ -151,4 +151,17 @@ Hospital EHR (Epic / Cerner)
 
 ---
 
+## Administrative Intelligence
+
+The same oncology model also powers hospital operations — no additional data collection required:
+
+| Prediction | Typical savings |
+|-----------|----------------|
+| Chemotherapy volume forecast | Better infusion center staffing |
+| Treatment cycle → ED visit risk | Proactive intervention planning |
+| Patient acuity scoring | Nurse ratio optimization |
+| No-show risk | Targeted reminder campaigns |
+
+---
+
 *For questions: see docs/healthcare-product-brief.md*

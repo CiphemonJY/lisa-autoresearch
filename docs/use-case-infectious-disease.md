@@ -156,6 +156,19 @@ A resistance pattern detected 2 weeks earlier saves lives and hospitals know thi
 
 **The ask from hospitals is small:** Share 5 anonymized numbers per week. Get back a regional resistance map that makes you look smart to your board.
 
+## Administrative Intelligence
+
+The surveillance data immediately enables operational forecasting:
+
+| Prediction | Value |
+|-----------|-------|
+| Seasonal flu volume forecast | ED staffing optimization, $500K–$2M/yr in avoided overtime |
+| Outbreak early warning | Proactive bed capacity planning |
+| Antibiotic demand prediction | Supply chain optimization, $100K–$300K/yr |
+| Regional illness prevalence | Marketing + community health planning |
+
+---
+
 ## Next Steps
 
 1. **Identify 3 hospitals** in one region willing to participate (family MD/PhD network)

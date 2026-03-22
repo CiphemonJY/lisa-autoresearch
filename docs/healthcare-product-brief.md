@@ -95,6 +95,19 @@ Hospital C (Oracle)    ─┘       (your Mac Mini)
 - **Price:** $250K–$1M per model per indication
 - **2 deals = $500K–$2M ARR**
 
+### Administrative Intelligence (Year 1+)
+Same data, different outputs — no additional data collection required.
+
+| Product | Monthly fee | Value driver |
+|---------|------------|--------------|
+| Volume forecasting dashboard | $5K–$15K | ER/OR staffing optimization |
+| OR block utilization | $10K–$25K | Recovered OR revenue |
+| Readmission risk scoring | $3K–$8K | CMS penalty avoidance |
+| Staffing optimization | $5K–$12K | Nurse ratio compliance |
+| Full administrative suite | $20K–$50K | System-wide optimization |
+
+**Administrative AI revenue:** $60K–$180K/year per health system on top of clinical model
+
 ---
 
 ## Compliance Posture

@@ -810,6 +810,182 @@ def build_dashboard():
                 outputs=[output_text, status_text],
             )
 
+        # ──────────────────────────────────────────────────────────────
+        # Tab 5: RAG Q&A (Knowledge Assistant)
+        # ──────────────────────────────────────────────────────────────
+        with tabs.tab("💬 RAG Knowledge Assistant"):
+            gr.Markdown("### Ask Questions About Your Organization's Data")
+            gr.Markdown(
+                "The RAG engine retrieves relevant documents and generates "
+                "grounded answers using the trained model. Index your data first, "
+                "then ask strategy, volume, or financial questions."
+            )
+
+            # Lazy-load the RAG engine so dashboard starts without a model
+            rag_state = gr.State(value=None)
+            rag_indexed_flag = gr.State(value=False)
+
+            with gr.Row():
+                model_for_rag = gr.Dropdown(
+                    label="Model",
+                    value="EleutherAI/pythia-70m",
+                    interactive=True,
+                    allow_edit=True,
+                    info="Must match the model used during training",
+                )
+                rag_store_dir = gr.Textbox(
+                    label="Vector Store Directory",
+                    value="rag_store",
+                    interactive=True,
+                    info="Directory where indexed documents are stored",
+                )
+                index_btn = gr.Button("📥 Index Documents", variant="secondary")
+
+            index_status = gr.Markdown("**Index status:** Not indexed")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    query_box = gr.Textbox(
+                        label="Ask a question",
+                        placeholder="e.g. What were total FY24 admissions across the network?",
+                        lines=2,
+                        interactive=True,
+                    )
+                    query_type = gr.Radio(
+                        label="Query type",
+                        value="volume",
+                        choices=["volume", "financial", "strategic", "general"],
+                        interactive=True,
+                    )
+                    with gr.Row():
+                        ask_btn = gr.Button("🔍 Ask", variant="primary")
+                        rag_verbose_toggle = gr.Checkbox(
+                            label="Show retrieved sources",
+                            value=False,
+                            interactive=True,
+                        )
+                        clear_chat_btn = gr.Button("🗑 Clear", variant="secondary")
+
+                with gr.Column(scale=1):
+                    gr.Markdown("**Sample questions:**")
+                    gr.Markdown(
+                        "• *What were total FY24 admissions?*\n"
+                        "• *Which service lines grew most in Q2?*\n"
+                        "• *What is the projected ED volume for next quarter?*\n"
+                        "• *Compare OR utilization across sites*"
+                    )
+
+            answer_box = gr.Textbox(
+                label="Answer",
+                lines=4,
+                interactive=False,
+                show_copy_button=True,
+            )
+            sources_box = gr.JSON(label="Retrieved Sources (debug)", visible=False)
+
+            def build_rag_engine(model_name, store_dir):
+                """Lazily build the RAG engine on first index/query."""
+                try:
+                    import torch
+                    from transformers import AutoModelForCausalLM, AutoTokenizer
+                    from connectors.rag_engine import RAGEngine
+
+                    tokenizer = AutoTokenizer.from_pretrained(model_name)
+                    model = AutoModelForCausalLM.from_pretrained(model_name)
+                    rag = RAGEngine(
+                        model=model,
+                        tokenizer=tokenizer,
+                        store_dir=str(BASE_DIR / store_dir),
+                    )
+                    return rag, None
+                except Exception as e:
+                    return None, str(e)
+
+            def index_documents(model_name, store_dir, progress=gr.Progress()):
+                progress(0, desc="Building RAG engine...")
+                rag, err = build_rag_engine(model_name, store_dir)
+                if err:
+                    return f"❌ Failed to load model: {err}", gr.update(value=False)
+
+                progress(0.3, desc="Indexing sample data...")
+                # Index sample healthcare volume data by default
+                sample_data = {
+                    "FY23": {"Q1": 11200, "Q2": 11900, "Q3": 12100, "Q4": 11800},
+                    "FY24": {"Q1": 12345, "Q2": 13102, "Q3": 11890, "Q4": 13107},
+                }
+                rag.index_volume_data(sample_data, source="sample_hospital_network")
+                progress(0.9, desc="Saving index...")
+                rag.vector_store.save()
+                return (
+                    f"✅ Indexed {len(rag.vector_store)} chunks from sample data.\n"
+                    f"   Store: {store_dir}/ | Model: {model_name}\n"
+                    f"   Now ask questions below!",
+                    gr.update(value=True),
+                )
+
+            def query_rag_engine(query, query_type_val, verbose, model_name, store_dir, rag_engine):
+                if rag_engine is None:
+                    rag_engine, err = build_rag_engine(model_name, store_dir)
+                    if err:
+                        return f"❌ Model load failed: {err}", gr.update(visible=False), gr.update(value=False)
+
+                if query_type_val == "volume":
+                    result = rag_engine.ask_volume(query, verbose=verbose)
+                elif query_type_val == "financial":
+                    result = rag_engine.ask_financial(query, verbose=verbose)
+                elif query_type_val == "strategic":
+                    result = rag_engine.ask_strategic(query, verbose=verbose)
+                else:
+                    result = rag_engine.query(query, verbose=verbose)
+
+                sources = []
+                for chunk, score in result.get("retrieved_chunks", []):
+                    sources.append({
+                        "text": chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text,
+                        "score": round(score, 3),
+                        "source": chunk.metadata.get("source", "unknown"),
+                    })
+
+                answer = result["answer"]
+                sources_update = gr.update(value={"sources": sources}, visible=bool(sources))
+                return answer, sources_update, gr.update(value=True)
+
+            def clear_chat():
+                return "", gr.update(visible=False), gr.update(value=False)
+
+            index_btn.click(
+                fn=index_documents,
+                inputs=[model_for_rag, rag_store_dir],
+                outputs=[index_status, rag_indexed_flag],
+            )
+
+            ask_btn.click(
+                fn=query_rag_engine,
+                inputs=[
+                    query_box, query_type, rag_verbose_toggle,
+                    model_for_rag, rag_store_dir, rag_state,
+                ],
+                outputs=[answer_box, sources_box, rag_indexed_flag],
+            )
+            query_box.submit(
+                fn=query_rag_engine,
+                inputs=[
+                    query_box, query_type, rag_verbose_toggle,
+                    model_for_rag, rag_store_dir, rag_state,
+                ],
+                outputs=[answer_box, sources_box, rag_indexed_flag],
+            )
+            rag_verbose_toggle.change(
+                fn=lambda show: gr.update(visible=show),
+                inputs=[rag_verbose_toggle],
+                outputs=[sources_box],
+            )
+            clear_chat_btn.click(
+                fn=clear_chat,
+                inputs=[],
+                outputs=[answer_box, sources_box, rag_indexed_flag],
+            )
+
     return demo
 
 

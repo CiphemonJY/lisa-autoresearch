@@ -10,6 +10,8 @@ import os, sys, time, torch, logging, socket, json, struct, pickle, argparse
 from pathlib import Path
 from typing import Optional
 
+from utils.audit_logger import AuditLogger
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -46,6 +48,7 @@ class FederatedClient:
         self.lora_count = 0
         self.round_num = 0
         self.sock = None
+        self.audit_logger = AuditLogger(audit_dir="audit_logs")
 
     def connect(self) -> bool:
         try:
@@ -53,6 +56,12 @@ class FederatedClient:
             self.sock.settimeout(30)
             self.sock.connect((self.server_host, self.server_port))
             log.info(f"Connected to server at {self.server_host}:{self.server_port}")
+            self.audit_logger.log_event(
+                event_type="client_connect",
+                client_id=CLIENT_ID,
+                ip_address=f"{self.server_host}:{self.server_port}",
+                success=True,
+            )
 
             # Send auth token first if configured
             if self.auth_token is not None:
@@ -259,6 +268,15 @@ class FederatedClient:
                     _, tensor = self._recv_tensor_streaming()
                     grads[name] = tensor
                 log.info(f"  Received {len(large_names)} streamed large tensors")
+
+            self.audit_logger.log_event(
+                event_type="model_update_receive",
+                client_id=CLIENT_ID,
+                data_type="aggregated_model",
+                record_count=len(grads),
+                success=True,
+                epoch=str(self.round_num),
+            )
         except socket.timeout:
             log.warning("Timeout waiting for model update from server")
             return grads
@@ -316,6 +334,15 @@ class FederatedClient:
         if texts is None or len(texts) == 0:
             log.info("No data from server, using synthetic batch")
             texts = ["The quick brown fox jumps over the lazy dog."] * 100
+
+        self.audit_logger.log_event(
+            event_type="data_access",
+            client_id=CLIENT_ID,
+            data_type="training_data",
+            record_count=len(texts),
+            success=True,
+            epoch=str(self.round_num),
+        )
 
         # Ensure LoRA is applied (handles both first-time and reconnect)
         if self.lora_count == 0:
@@ -403,6 +430,14 @@ class FederatedClient:
             if "lora_" in name and param.grad is not None:
                 grads[name] = param.grad.clone().cpu()
         log.info(f"  Extracted {len(grads)} gradient tensors")
+        self.audit_logger.log_event(
+            event_type="gradient_send",
+            client_id=CLIENT_ID,
+            data_type="gradient_update",
+            record_count=len(grads),
+            success=True,
+            epoch=str(self.round_num),
+        )
 
         if self.sock is None:
             log.info("No server connection - saving gradients locally")
@@ -476,6 +511,11 @@ class FederatedClient:
                 self.send_json({"type": "disconnect", "client_id": CLIENT_ID})
             except Exception as e:
                 log.warning(f"Failed to send disconnect message to server: {e}")
+            self.audit_logger.log_event(
+                event_type="client_disconnect",
+                client_id=CLIENT_ID,
+                success=True,
+            )
             self.sock.close()
             self.sock = None
 

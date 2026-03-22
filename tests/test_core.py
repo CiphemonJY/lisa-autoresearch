@@ -1038,6 +1038,124 @@ def test_byzantine_fallback_when_all_look_malicious():
 
 
 # ============================================================================
+# HIPAA Audit Logger Tests
+# ============================================================================
+
+def test_audit_logger_records_events():
+    """Audit logger records events with all required fields."""
+    import tempfile
+    from utils.audit_logger import AuditLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = AuditLogger(audit_dir=tmpdir)
+
+        event = logger.log_event(
+            event_type="gradient_send",
+            client_id="hospital_A",
+            data_type="gradient_update",
+            record_count=147456,
+            success=True,
+        )
+
+        assert event["event_type"] == "gradient_send"
+        assert event["client_id"] == "hospital_A"
+        assert event["data_type"] == "gradient_update"
+        assert event["record_count"] == 147456
+        assert event["success"] is True
+        assert "timestamp" in event
+        assert event["timestamp"].endswith("Z")
+        assert "chain_hash" in event
+        assert "prev_hash" in event
+
+        # Verify we can decrypt the file
+        events = logger.decrypt_log_file(datetime.utcnow().strftime("%Y-%m-%d"))
+        assert len(events) >= 1
+        assert any(e["event_type"] == "gradient_send" for e in events)
+
+    print("[PASS] test_audit_logger_records_events")
+
+
+def test_audit_logger_chain_integrity():
+    """Each log entry's chain_hash links to the previous entry."""
+    import tempfile
+    from utils.audit_logger import AuditLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = AuditLogger(audit_dir=tmpdir)
+
+        # Log several events
+        logger.log_event(event_type="client_connect", client_id="hospital_A")
+        logger.log_event(event_type="gradient_send", client_id="hospital_A")
+        logger.log_event(event_type="checkpoint_save", client_id="hospital_A")
+
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        result = logger.verify_chain(date_str)
+
+        assert result["valid"] is True, f"Chain integrity failed: {result['errors']}"
+        assert result["entries_checked"] == 3
+        assert len(result["errors"]) == 0
+
+    print("[PASS] test_audit_logger_chain_integrity")
+
+
+def test_audit_logger_tamper_detection():
+    """Tampering with a log entry is detected by chain verification."""
+    import tempfile
+    from utils.audit_logger import AuditLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = AuditLogger(audit_dir=tmpdir)
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+        logger.log_event(event_type="client_connect", client_id="hospital_A")
+        logger.log_event(event_type="gradient_send", client_id="hospital_A")
+
+        # Tamper with the log file by appending a fake entry
+        log_file = Path(tmpdir) / f"audit_{date_str}.log"
+        fake_entry = b"FAKE_TAMPERED_ENTRY_DATA_THAT_IS_NOT_VALID_FERNET"
+        with open(log_file, "ab") as f:
+            f.write(fake_entry + b"\n")
+
+        result = logger.verify_chain(date_str)
+        # The fake entry will fail to decrypt — this is detected as a tamper
+        assert result["valid"] is False or len(result["errors"]) > 0
+
+    print("[PASS] test_audit_logger_tamper_detection")
+
+
+def test_audit_logger_compliance_report():
+    """Compliance report aggregates events correctly for HIPAA audit."""
+    import tempfile
+    from utils.audit_logger import AuditLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = AuditLogger(audit_dir=tmpdir)
+        start = datetime.utcnow().strftime("%Y-%m-%d")
+
+        logger.log_event(event_type="client_connect", client_id="hospital_A")
+        logger.log_event(event_type="gradient_send", client_id="hospital_A")
+        logger.log_event(event_type="gradient_receive", client_id="hospital_B")
+        logger.log_event(event_type="checkpoint_save", client_id="hospital_A")
+
+        report = logger.generate_compliance_report(
+            start_date=start,
+            end_date=datetime.utcnow().strftime("%Y-%m-%d"),
+        )
+
+        assert report["total_events"] == 4
+        assert report["event_type_counts"]["client_connect"] == 1
+        assert report["event_type_counts"]["gradient_send"] == 1
+        assert report["event_type_counts"]["gradient_receive"] == 1
+        assert report["event_type_counts"]["checkpoint_save"] == 1
+        assert "hospital_A" in report["client_activity"]
+        assert "hospital_B" in report["client_activity"]
+        assert report["retention_policy"]["required_years"] == 7
+        assert report["chain_verification"]["valid"] is True
+
+    print("[PASS] test_audit_logger_compliance_report")
+
+
+# ============================================================================
 # pytest entry points
 # ============================================================================
 
@@ -1071,6 +1189,11 @@ if __name__ == "__main__":
         test_byzantine_aggregate_preserves_shape,
         test_byzantine_krum_selects_closest_to_neighbors,
         test_byzantine_fallback_when_all_look_malicious,
+        # HIPAA audit logger
+        test_audit_logger_records_events,
+        test_audit_logger_chain_integrity,
+        test_audit_logger_tamper_detection,
+        test_audit_logger_compliance_report,
     ]
 
     failed = []

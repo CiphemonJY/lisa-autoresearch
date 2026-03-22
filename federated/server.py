@@ -38,6 +38,7 @@ import psutil
 from federated.privacy import GradientPrivacy, DPConfig
 from federated.byzantine import ByzantineResilientAggregator
 from utils.checkpoint_manager import CheckpointManager
+from utils.audit_logger import AuditLogger
 
 # Optional FastAPI
 try:
@@ -411,6 +412,9 @@ class FederatedServer:
         # Checkpoint manager with versioning & rollback
         self.checkpoint_manager = CheckpointManager(str(self.checkpoint_dir))
 
+        # HIPAA audit logger
+        self.audit_logger = AuditLogger(audit_dir="audit_logs")
+
         # Load model
         self._init_model()
 
@@ -500,6 +504,13 @@ class FederatedServer:
                 self.metrics.active_clients += 1
                 logger.info(f"Registered client: {client_id}")
 
+        self.audit_logger.log_event(
+            event_type="client_connect",
+            client_id=client_id,
+            ip_address=None,
+            success=True,
+        )
+
         return {"status": "registered", "client_id": client_id}
 
     def receive_gradient(self, update: Dict) -> Dict:
@@ -548,6 +559,15 @@ class FederatedServer:
             rs.clients_joined.append(client_id)
 
             self.metrics.total_gradients_received += 1
+
+            # HIPAA audit: gradient received from client
+            self.audit_logger.log_event(
+                event_type="gradient_receive",
+                client_id=client_id,
+                data_type="gradient_update",
+                record_count=update.get("num_samples", 0),
+                success=True,
+            )
 
             # Update client stats
             if client_id in self.clients:
@@ -620,6 +640,14 @@ class FederatedServer:
 
         # Save checkpoint
         self._save_model(round_num)
+        self.audit_logger.log_event(
+            event_type="checkpoint_save",
+            client_id=None,
+            data_type="model_checkpoint",
+            record_count=1,
+            success=True,
+            epoch=str(round_num),
+        )
 
         # Save versioned checkpoint with metadata
         try:
@@ -727,6 +755,14 @@ class FederatedServer:
         with self._get_lock():
             # Return current model
             if self.current_model:
+                self.audit_logger.log_event(
+                    event_type="model_update_send",
+                    client_id=client_id,
+                    data_type="aggregated_model",
+                    record_count=1,
+                    success=True,
+                    epoch=str(self.global_round),
+                )
                 return {
                     "round": self.global_round,
                     "model_data": self.current_model,
@@ -1079,6 +1115,12 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
 
         # Register client
         server.register_client(client_id)
+        server.audit_logger.log_event(
+            event_type="client_connect",
+            client_id=client_id,
+            ip_address=self.client_address[0] if self.client_address else None,
+            success=True,
+        )
 
         # Build gradient update dict for FederatedServer.receive_gradient
         grad_norm = float(torch.norm(torch.cat([t.flatten() for t in grad_state.values()])).item())
@@ -1118,6 +1160,17 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             logger.info(
                 f"[{client_id}] Gradient recorded (round {round_num}): "
                 f"norm={grad_norm:.4f}, tensors={len(grad_state)}"
+            )
+
+            # HIPAA audit: gradient received from client
+            server.audit_logger.log_event(
+                event_type="gradient_receive",
+                client_id=client_id,
+                data_type="gradient_update",
+                record_count=len(grad_state),
+                ip_address=self.client_address[0] if self.client_address else None,
+                success=True,
+                epoch=str(round_num),
             )
 
             # Check if we should aggregate
@@ -1176,6 +1229,14 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
                     if aggregated:
                         server._apply_gradient(aggregated)
                         server._save_model(round_num)
+                        server.audit_logger.log_event(
+                            event_type="checkpoint_save",
+                            client_id=None,
+                            data_type="model_checkpoint",
+                            record_count=1,
+                            success=True,
+                            epoch=str(round_num),
+                        )
                     # Log round summary
                     contrib_names = ", ".join(updates[u].get("client_id", "?") for u in range(len(updates)))
                     disc_names = ", ".join(disconnected) if disconnected else ""
@@ -1283,6 +1344,15 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
             else:
                 self.request.sendall(struct.pack("!I", len(response_data)) + response_data)
             logger.info(f"[{self.client_address}] Update sent for round {round_num}")
+            server.audit_logger.log_event(
+                event_type="model_update_send",
+                client_id=completed_client_id,
+                data_type="aggregated_model",
+                record_count=len(update_tensors) if update_tensors else 0,
+                ip_address=self.client_address[0] if self.client_address else None,
+                success=True,
+                epoch=str(round_num),
+            )
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             logger.warning(f"[{self.client_address}] Client disconnected before receiving update: {e}")
 

@@ -364,7 +364,10 @@ class LocalTrainer:
         self.optimizer = None
         self.compressor = GradientCompressor(config)
         self.privacy = GradientPrivacy(config)
-        
+        # Raw (uncompressed) gradient dict for P2P sharing
+        self._latest_raw_gradients: Optional[Dict] = None
+        self._latest_raw_round: int = 0
+
         self._setup_model()
     
     def _setup_model(self):
@@ -572,6 +575,10 @@ class LocalTrainer:
         # Compress
         compressed, comp_info = self.compressor.compress(state_dict)
         
+        # Store raw gradients for P2P sharing
+        self._latest_raw_gradients = state_dict
+        self._latest_raw_round = round_number
+
         return GradientUpdate(
             client_id=self.client_id,
             round_number=round_number,
@@ -600,17 +607,52 @@ class FederatedClient:
     """
     
     def __init__(self, client_id: str, server_url: str = "http://localhost:8000",
-                 config: Optional[Dict] = None):
+                 config: Optional[Dict] = None,
+                 p2p_enabled: bool = False,
+                 bootstrap_server: Optional[str] = None):
         self.client_id = client_id
         self.server_url = server_url.rstrip("/")
         self.config = {**DEFAULT_CONFIG, **(config or {})}
-        
+
         self.state = ClientState(client_id=client_id)
         self.trainer = LocalTrainer(client_id, self.config)
         self.compressor = GradientCompressor(self.config)
-        
+
         self._client_key = hashlib.sha256(client_id.encode()).hexdigest()[:16]
-        
+
+        # P2P state (initialized only if p2p_enabled=True)
+        self.p2p_enabled = p2p_enabled
+        self.p2p_client = None
+        if self.p2p_enabled:
+            try:
+                from federated.p2p import P2PClient, P2PRegistry
+
+                # Determine bootstrap server address
+                bootstrap_addr = bootstrap_server
+                if not bootstrap_addr:
+                    # Derive from server_url: use same host, port 8081
+                    import re
+                    m = re.match(r"https?://([^:]+):(\d+)", self.server_url)
+                    if m:
+                        bootstrap_addr = f"{m.group(1)}:8081"
+                    else:
+                        bootstrap_addr = "127.0.0.1:8081"
+
+                logger.info(f"P2P enabled: bootstrap server = {bootstrap_addr}")
+                self._p2p_registry = P2PRegistry(
+                    bootstrap_server=f"http://{bootstrap_addr}",
+                    port=0,  # Let OS assign a port
+                )
+                peers = self._p2p_registry.register()
+                self.p2p_client = P2PClient(client_id, self._p2p_registry)
+                self.p2p_client.start_exchange_server()
+                self.p2p_client.peers = peers
+                logger.info(f"P2P: {len(peers)} initial peers discovered")
+            except Exception as e:
+                logger.warning(f"P2P initialization failed: {e}. Continuing without P2P.")
+                self.p2p_enabled = False
+                self.p2p_client = None
+
         logger.info(f"FederatedClient '{client_id}' initialized (key={self._client_key})")
     
     def train_and_submit(self, round_number: Optional[int] = None) -> Dict:
@@ -627,6 +669,34 @@ class FederatedClient:
         
         # Compute gradient update
         update = self.trainer.compute_gradient_update(rn)
+        
+        # Share raw gradients with P2P peers and fetch theirs for averaging
+        if self.p2p_enabled and self.p2p_client is not None:
+            raw_grads, raw_round = self.trainer._latest_raw_gradients, self.trainer._latest_raw_round
+            if raw_grads:
+                self.p2p_client.update_local_gradient(raw_grads, raw_round)
+                peer_avg_grads = self.p2p_client.sync_with_peers(raw_grads)
+                if peer_avg_grads and peer_avg_grads != raw_grads:
+                    logger.info(f"P2P: averaged {len(peer_avg_grads)} tensors with {len(self.p2p_client.peers)} peers")
+                    # Recompress with peer-averaged gradients and rebuild update for submission
+                    flat_grad = np.concatenate([v.flatten() for v in peer_avg_grads.values()])
+                    peer_grad_norm = float(np.linalg.norm(flat_grad))
+                    compressed, comp_info = self.compressor.compress(peer_avg_grads)
+                    # Rebuild update with peer-averaged gradients
+                    update = GradientUpdate(
+                        client_id=self.client_id,
+                        round_number=rn,
+                        timestamp=time.time(),
+                        num_samples=update.num_samples,
+                        param_names=list(peer_avg_grads.keys()),
+                        compressed_data=compressed,
+                        compression_info=comp_info,
+                        noise_seed=update.noise_seed,
+                        dp_epsilon=update.dp_epsilon,
+                        gradient_norm=peer_grad_norm,
+                        loss_before=update.loss_before,
+                        loss_after=update.loss_after,
+                    )
         
         # Submit to server
         try:
@@ -721,6 +791,22 @@ def main():
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--dp", action="store_true", help="Enable differential privacy")
     parser.add_argument("--dp-epsilon", type=float, default=1.0)
+    parser.add_argument(
+        "--p2p-enable",
+        action="store_true",
+        help="Enable peer-to-peer gradient exchange with other clients",
+    )
+    parser.add_argument(
+        "--bootstrap-server",
+        default=None,
+        help=(
+            "P2P bootstrap server address (host:port). "
+            "If not set but --p2p-enable is used, defaults to the --server address "
+            "with port 8081 (e.g. 127.0.0.1:8081 for localhost). "
+            "Set to the address of a machine running: "
+            "python -m federated.p2p --bootstrap --port 8081"
+        ),
+    )
     
     args = parser.parse_args()
     
@@ -739,7 +825,13 @@ def main():
         config["differential_privacy"]["enabled"] = True
         config["differential_privacy"]["epsilon"] = args.dp_epsilon
     
-    client = FederatedClient(args.client_id, args.server, config)
+    client = FederatedClient(
+        args.client_id,
+        args.server,
+        config,
+        p2p_enabled=args.p2p_enable,
+        bootstrap_server=args.bootstrap_server,
+    )
     client.run_rounds(args.rounds)
 
 

@@ -162,18 +162,6 @@ class FederatedClient:
             log.warning(f"Server disconnected while sending update: {e}")
             return grads
         return grads
-            try:
-                from federated.compression import decompress_gradients
-                compressed = pickle.loads(raw)
-                grads = decompress_gradients(compressed, compression_meta)
-                log.info(f"  Decompressed {len(grads)} tensors (method={compression_method})")
-            except Exception as e:
-                log.warning(f"Decompression failed ({e}), treating as uncompressed pickle")
-                grads = pickle.loads(raw)
-        else:
-            grads = pickle.loads(raw)
-
-        return grads
 
     def load_model(self) -> bool:
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig

@@ -13,7 +13,7 @@ Three steps to run your first federated round with TinyLlama:
 ### Step 1 — Install dependencies
 
 ```bash
-pip install torch transformers datasets huggingface_hub
+pip install torch transformers datasets huggingface_hub numpy cryptography requests psutil pyyaml fastapi uvicorn pytest
 ```
 
 ### Step 2 — Start the server (Terminal 1)

@@ -36,7 +36,8 @@ Built on **LISA** (Layer-wise Importance Sampling): only train the layers that m
 
 ### 1. Install dependencies
 ```bash
-pip install torch transformers datasets huggingface_hub
+pip install torch transformers datasets huggingface_hub numpy \
+  cryptography requests psutil pyyaml fastapi uvicorn pytest
 ```
 
 ### 2. Start the server

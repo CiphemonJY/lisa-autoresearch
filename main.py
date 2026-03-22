@@ -397,6 +397,70 @@ def cmd_simulate(args):
     print(f"  Final round: {final_status['global_round']}")
 
 
+def cmd_rollback(args):
+    """List checkpoints or rollback the server to a specific checkpoint."""
+    from utils.checkpoint_manager import CheckpointManager
+
+    mgr = CheckpointManager(args.checkpoint_dir)
+
+    if args.list_checkpoints:
+        checkpoints = mgr.list_checkpoints()
+        if not checkpoints:
+            print("No checkpoints found.")
+            return
+
+        print(f"{'Checkpoint ID':<25} {'Round':>6} {'Ver':>4} {'Timestamp':<26} {'Perplexity':>11} {'Clients':>8} {'DP':>4}")
+        print("-" * 90)
+        for ckpt in checkpoints:
+            ts = ckpt.get("timestamp_iso", "")
+            if ts:
+                # Strip microseconds
+                ts = ts[:19]
+            ppl = f"{ckpt.get('perplexity', 'N/A')}"
+            if ppl != "N/A" and ppl != "None":
+                ppl = f"{float(ppl):.4f}"
+            dp = "yes" if ckpt.get("dp_enabled") else "no"
+            print(
+                f"{ckpt.get('checkpoint_id', ''):<25} "
+                f"{ckpt.get('round', 0):>6} "
+                f"{ckpt.get('version', 0):>4} "
+                f"{ts:<26} "
+                f"{ppl:>11} "
+                f"{ckpt.get('client_count', 'N/A'):>8} "
+                f"{dp:>4}"
+            )
+        return
+
+    if args.rollback_to:
+        print(f"Rolling back to checkpoint: {args.rollback_to}")
+        ok = mgr.rollback(args.rollback_to)
+        if ok:
+            print("Rollback validated successfully.")
+            # Optionally print metadata
+            data = mgr.load(args.rollback_to)
+            meta = data.get("metadata", {})
+            print(f"  Round: {meta.get('round')}")
+            print(f"  Version: {meta.get('version')}")
+            print(f"  Clients: {meta.get('client_count')}")
+            print(f"  Compression: {meta.get('compression')}")
+            print(f"  DP enabled: {meta.get('dp_enabled')}")
+        else:
+            print(f"ERROR: Rollback failed - checkpoint not found or corrupted.")
+            sys.exit(1)
+        return
+
+    # No flags: show usage
+    print("Rollback mode: list or restore checkpoints")
+    print()
+    print(f"  Checkpoint directory: {args.checkpoint_dir}")
+    print()
+    print("List checkpoints:")
+    print(f"  python main.py --mode rollback --checkpoint-dir {args.checkpoint_dir} --list")
+    print()
+    print("Rollback to a checkpoint:")
+    print(f"  python main.py --mode rollback --checkpoint-dir {args.checkpoint_dir} --to round_3_v1")
+
+
 def main():
     # Pre-parse --config so we can load config file before building the full parser
     _pre_parser = argparse.ArgumentParser(add_help=False)
@@ -444,7 +508,7 @@ Examples:
     # Mode selection
     parser.add_argument(
         "--mode",
-        choices=["hardware", "train", "offload", "server", "client", "simulate"],
+        choices=["hardware", "train", "offload", "server", "client", "simulate", "rollback"],
         default="hardware",
         help="Operation mode. Default: hardware."
     )
@@ -573,6 +637,28 @@ Examples:
         help="Number of simulated clients for --mode simulate. Default: 3."
     )
 
+    # Rollback arguments
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        dest="checkpoint_dir",
+        help="Checkpoint directory for rollback mode. Default: checkpoints."
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_checkpoints",
+        help="List available checkpoints (rollback mode)."
+    )
+    parser.add_argument(
+        "--to",
+        type=str,
+        dest="rollback_to",
+        default=None,
+        help="Rollback to this checkpoint ID (e.g. round_3_v1)."
+    )
+
     # Client arguments
     parser.add_argument(
         "--client-id",
@@ -609,6 +695,8 @@ Examples:
         cmd_client(args)
     elif args.mode == "simulate":
         cmd_simulate(args)
+    elif args.mode == "rollback":
+        cmd_rollback(args)
 
 
 if __name__ == "__main__":

@@ -33,8 +33,11 @@ import copy
 
 import numpy as np
 import torch
+import psutil
 
 from federated.privacy import GradientPrivacy, DPConfig
+from federated.byzantine import ByzantineResilientAggregator
+from utils.checkpoint_manager import CheckpointManager
 
 # Optional FastAPI
 try:
@@ -75,6 +78,10 @@ DEFAULT_CONFIG = {
     "save_model_every": 5,
     "checkpoint_dir": "checkpoints",
     "log_dir": "logs",
+    # Byzantine resilience
+    "byzantine_method": "none",  # none, krum, trimmed_mean, norm
+    "byzantine_f": 1,           # max expected malicious clients (krum)
+    "byzantine_alpha": 0.1,     # trim fraction for trimmed_mean
 }
 
 
@@ -354,6 +361,11 @@ class FederatedServer:
         self.round_state: Dict[int, RoundState] = {}
         self.metrics = ServerMetrics()
 
+        # Differential privacy (must init before aggregator)
+        self.dp_config = self.config.get("dp_config") or DPConfig(enabled=False)
+        self.gradient_privacy = GradientPrivacy(self.dp_config)
+        self._dp_rounds: int = 0  # tracks rounds for epsilon computation
+
         self.validator = GradientValidator(self.config)
         self.aggregator = GradientAggregator(
             method=self.config.get("aggregation_method", "fedavg"),
@@ -362,16 +374,30 @@ class FederatedServer:
             dp_config=self.dp_config,
         )
 
+        # Byzantine resilience
+        byz_method = self.config.get("byzantine_method", "none")
+        if byz_method not in ("none", "krum", "trimmed_mean", "norm"):
+            byz_method = "none"
+        self.byzantine_method = byz_method
+        if byz_method != "none":
+            self.byzantine_aggregator = ByzantineResilientAggregator(
+                method=byz_method,
+                f=self.config.get("byzantine_f", 1),
+                alpha=self.config.get("byzantine_alpha", 0.1),
+            )
+            logger.info(
+                f"Byzantine resilience enabled: method={byz_method}, "
+                f"f={self.config.get('byzantine_f', 1)}, "
+                f"alpha={self.config.get('byzantine_alpha', 0.1)}"
+            )
+        else:
+            self.byzantine_aggregator = None
+
         self.current_model: Optional[bytes] = None
         self.global_round: int = 0
         self.compression_method = self.config.get("compression_method", "none")
         self.compression_k = self.config.get("compression_k", 0.1)
         self.compression_bits = self.config.get("compression_bits", 8)
-
-        # Differential privacy
-        self.dp_config = config.get("dp_config") or DPConfig(enabled=False)
-        self.gradient_privacy = GradientPrivacy(self.dp_config)
-        self._dp_rounds: int = 0  # tracks rounds for epsilon computation
 
         self._lock = threading.RLock()
 
@@ -380,6 +406,9 @@ class FederatedServer:
         self.log_dir = Path(self.config.get("log_dir", "logs"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Checkpoint manager with versioning & rollback
+        self.checkpoint_manager = CheckpointManager(str(self.checkpoint_dir))
 
         # Load model
         self._init_model()
@@ -415,8 +444,25 @@ class FederatedServer:
                 ignore_mismatched_sizes=True,
             )
 
-            # Save initial model
-            self._save_model(0)
+            # Try to resume from the latest checkpoint
+            latest_id = self.checkpoint_manager.get_latest()
+            if latest_id is not None:
+                logger.info(f"Resuming from checkpoint: {latest_id}")
+                try:
+                    ckpt_data = self.checkpoint_manager.load(latest_id)
+                    self.model.load_state_dict(ckpt_data["model"])
+                    self.global_round = ckpt_data["metadata"].get("round", 0)
+                    logger.info(
+                        f"  Restored round {self.global_round} "
+                        f"({latest_id}), perplexity={ckpt_data['metadata'].get('perplexity')}"
+                    )
+                except Exception as e:
+                    logger.warning(f"  Could not restore checkpoint {latest_id}: {e}")
+
+            # Save initial model if no checkpoint to resume from
+            if latest_id is None:
+                self._save_model(0)
+
             logger.info(f"Model loaded: {sum(p.numel() for p in self.model.parameters()):,} params")
 
         except Exception as e:
@@ -537,7 +583,18 @@ class FederatedServer:
         reputations = {c.client_id: c.reputation for c in self.clients.values()}
 
         # Aggregate
-        aggregated, stats = self.aggregator.aggregate(updates, reputations)
+        if self.byzantine_aggregator is not None:
+            aggregated, byz_stats = self._aggregate_byzantine(updates, reputations)
+            byz_method = self.byzantine_method
+            excluded = byz_stats.get("num_excluded", 0)
+            total = len(updates)
+            logger.info(
+                f"Round {round_num} Byzantine aggregation ({byz_method}): "
+                f"{total - excluded}/{total} clients used — {byz_stats}"
+            )
+        else:
+            aggregated, stats = self.aggregator.aggregate(updates, reputations)
+            byz_stats = None
 
         if aggregated is None:
             rs.status = "failed"
@@ -563,6 +620,21 @@ class FederatedServer:
         # Save checkpoint
         self._save_model(round_num)
 
+        # Save versioned checkpoint with metadata
+        try:
+            metrics = {
+                "perplexity": None,  # filled by caller if available
+                "client_count": stats.get("num_updates", 0),
+                "compression": self.compression_method,
+                "dp_enabled": self.dp_config.enabled,
+                "round_time": round_time,
+            }
+            model_state = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            ckpt_id = self.checkpoint_manager.save(model_state, round_num, metrics)
+            logger.info(f"  Checkpoint saved: {ckpt_id}")
+        except Exception as e:
+            logger.warning(f"  Checkpoint save failed: {e}")
+
         # Complete round
         rs.status = "done"
         rs.completed_at = time.time()
@@ -581,6 +653,14 @@ class FederatedServer:
             (self.metrics.avg_round_time * (self.metrics.total_rounds - 1) + round_time)
             / self.metrics.total_rounds
         )
+
+        # Memory profiling
+        try:
+            _proc = psutil.Process()
+            mem_mb = _proc.memory_info().rss / 1e6
+            logger.info(f"  Peak memory: {mem_mb:.1f} MB")
+        except Exception:
+            pass
 
         logger.info(
             f"Round {round_num} complete: "
@@ -607,6 +687,35 @@ class FederatedServer:
                 current_state[key] = current_state[key].float() + lr * grad.float()
 
         self.model.load_state_dict(current_state)
+
+    def _aggregate_byzantine(
+        self,
+        updates: List[Dict],
+        reputations: Dict[str, float],
+    ) -> Tuple[Optional[bytes], Dict]:
+        """
+        Aggregate gradients using Byzantine-resilient method.
+
+        Decompresses raw updates, extracts grad dicts and weights,
+        delegates to ByzantineResilientAggregator, serializes result.
+        """
+        decompressed = self.aggregator._decompress_updates(updates)
+        if not decompressed:
+            return None, {"status": "no_valid_gradients"}
+
+        grad_dicts = [state_dict for _, _, state_dict in decompressed]
+        client_weights = []
+        for client_id, num_samples, _ in decompressed:
+            rep = reputations.get(client_id, 50.0) / 50.0
+            client_weights.append(num_samples * rep)
+
+        result, stats = self.byzantine_aggregator.aggregate(grad_dicts, client_weights)
+
+        serialized = pickle.dumps(result)
+        stats["status"] = "success"
+        stats["aggregated_size"] = len(serialized)
+        stats["num_updates"] = len(decompressed)
+        return serialized, stats
 
     def get_model_update(self, client_id: str, since_round: int = 0) -> Optional[Dict]:
         """
@@ -823,6 +932,50 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
         arr = np.frombuffer(raw, dtype=np.float32).copy()
         return name, torch.from_numpy(arr)
 
+    # --- Streaming gradient transfer (for large tensors > 10MB) ---
+    STREAMING_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+
+    def send_tensor_streaming(self, name: str, tensor: torch.Tensor, chunk_size: int = 65536):
+        """
+        Send a tensor using chunked streaming to avoid memory spikes.
+        Used for tensors larger than STREAMING_THRESHOLD.
+        Protocol: [name_len][name_bytes][num_bytes(8)][dtype_str_len][dtype_str][chunk1][chunk2]...
+        Each chunk is sent as: [chunk_size bytes]
+        """
+        name_bytes = name.encode("utf-8")
+        self.request.sendall(struct.pack("!I", len(name_bytes)) + name_bytes)
+
+        total_bytes = tensor.numel() * tensor.element_size()
+        self.request.sendall(struct.pack("!Q", total_bytes))  # 8-byte unsigned
+
+        dtype_str = str(tensor.dtype)
+        dtype_bytes = dtype_str.encode("utf-8")
+        self.request.sendall(struct.pack("!I", len(dtype_bytes)) + dtype_bytes)
+
+        shape_bytes = json.dumps(list(tensor.shape)).encode("utf-8")
+        self.request.sendall(struct.pack("!I", len(shape_bytes)) + shape_bytes)
+
+        np_bytes = tensor.cpu().numpy().tobytes()
+        for offset in range(0, len(np_bytes), chunk_size):
+            chunk = np_bytes[offset : offset + chunk_size]
+            self.request.sendall(chunk)
+
+    def _recv_tensor_streaming(self, name: str, total_bytes: int, dtype_str: str,
+                                chunk_size: int = 65536) -> torch.Tensor:
+        """
+        Receive a tensor in chunks without buffering full tensor until the end.
+        Accumulates into a bytes buffer, then converts to numpy/torch at the end.
+        """
+        buffer = b""
+        while len(buffer) < total_bytes:
+            chunk = self.request.recv(min(chunk_size, total_bytes - len(buffer)))
+            if not chunk:
+                break
+            buffer += chunk
+
+        arr = np.frombuffer(buffer, dtype=dtype_str).copy()
+        return torch.from_numpy(arr)
+
     def _send_tensor(self, name: str, tensor: torch.Tensor):
         """Send one tensor: [name_len][name_bytes][size][data]."""
         name_bytes = name.encode("utf-8")
@@ -833,13 +986,18 @@ class FederatedSocketHandler(socketserver.BaseRequestHandler):
 
     def _handle_gradients(self, server, lock, client_id: str, round_num: int):
         """Receive gradients, aggregate, send update back."""
-        # --- Step 2: receive pickle-serialized gradient dict ---
+        # --- Step 2: receive gradient dict (mixed: small=pickle, large=streaming) ---
         try:
             n_header = self._recv_exact(4)
             if len(n_header) < 4:
                 self._mark_client_disconnected(server, lock, client_id, round_num)
                 return
             n_bytes = struct.unpack("!I", n_header)[0]
+
+            # Check payload size; use streaming receive if > threshold
+            use_streaming = n_bytes > self.STREAMING_THRESHOLD
+            if use_streaming:
+                logger.info(f"[{client_id}] Large payload ({n_bytes/1e6:.1f} MB) - using streaming receive")
             raw = b""
             while len(raw) < n_bytes:
                 chunk = self.request.recv(min(65536, n_bytes - len(raw)))
@@ -1242,6 +1400,16 @@ def main():
                         help="DP noise multiplier σ (default 1.0, higher = more privacy, more noise)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                         help="DP per-gradient clipping bound C (default 1.0)")
+    parser.add_argument("--byzantine", choices=["none", "krum", "trimmed_mean", "norm"],
+                        default="none",
+                        help="Byzantine-resilient aggregation method")
+    parser.add_argument("--byzantine-f", type=int, default=1,
+                        help="Max expected malicious clients (for Krum, default 1)")
+    parser.add_argument("--byzantine-alpha", type=float, default=0.1,
+                        help="Trim fraction for Trimmed Mean (e.g. 0.1 = trim 10%% each tail)")
+    parser.add_argument("--checkpoint-dir", type=str,
+                        default=DEFAULT_CONFIG["checkpoint_dir"],
+                        help="Directory for model checkpoints (default: checkpoints)")
     parser.add_argument("--gen-token", action="store_true",
                         help="Generate a random auth token and exit")
 
@@ -1261,6 +1429,10 @@ def main():
     config["compression_method"] = args.compression
     config["compression_k"] = args.compression_k
     config["compression_bits"] = args.compression_bits
+    config["byzantine_method"] = args.byzantine
+    config["byzantine_f"] = args.byzantine_f
+    config["byzantine_alpha"] = args.byzantine_alpha
+    config["checkpoint_dir"] = args.checkpoint_dir
 
     # Differential privacy
     if args.dp:

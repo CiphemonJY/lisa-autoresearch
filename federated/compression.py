@@ -60,8 +60,11 @@ def compress_sparsify(grad_dict: Dict[str, torch.Tensor], k: float = 0.1) -> Dic
         flat = arr.flatten()
         k_count = max(1, int(len(flat) * k))
 
-        # Get indices of top K% by magnitude
+        # Get indices of top K% by magnitude, excluding NaN/Inf
         abs_flat = np.abs(flat)
+        # Replace NaN/Inf with 0 so they are NOT selected as "largest"
+        abs_flat = np.where(np.isfinite(abs_flat), abs_flat, 0.0)
+
         # Use argpartition for efficiency (O(n) vs O(n log n))
         if k_count < len(flat):
             threshold_idx = np.argpartition(abs_flat, -k_count)[-k_count]
@@ -69,8 +72,9 @@ def compress_sparsify(grad_dict: Dict[str, torch.Tensor], k: float = 0.1) -> Dic
         else:
             threshold = 0.0
 
-        # Keep elements above threshold
-        mask = abs_flat >= threshold
+        # Keep elements above threshold OR that are Inf (Inf is always "large")
+        has_inf = np.isinf(flat)
+        mask = (abs_flat >= threshold) | has_inf
         indices = np.where(mask)[0]
         values = flat[indices]
 
@@ -171,21 +175,45 @@ def compress_quantize(grad_dict: Dict[str, torch.Tensor], bits: int = 8) -> Dict
 
         flat = arr.flatten()
 
+        # Handle empty arrays
+        if flat.size == 0:
+            quantized_data[name] = {
+                'quantized': np.array([], dtype=dtype),
+                'scale': 1.0,
+                'zero_point': 0,
+                'shape': arr.shape,
+                'dtype': str(dtype),
+            }
+            total_quantized += 8  # just scale + zero_point
+            continue
+
+        # Handle NaN values: track positions and replace with fill value for quantization
+        nan_mask = np.isnan(flat)
+        num_nan = np.sum(nan_mask)
+        if num_nan > 0:
+            fill_val = 0.0  # replace NaN with 0 for quantization
+            flat = flat.copy()
+            flat[nan_mask] = fill_val
+
         # Compute scale and zero point for quantization
-        min_val = flat.min()
-        max_val_arr = flat.max()
+        min_val = float(flat.min())
+        max_val_arr = float(flat.max())
 
         if max_val_arr - min_val > 1e-8:
             scale = (max_val_arr - min_val) / max_val
             zero_point = int(-min_val / scale)
         else:
             scale = 1.0
-            zero_point = 0
+            zero_point = 128
 
         # Quantize
         quantized = np.clip((flat / scale + zero_point), 0, max_val).astype(dtype)
 
         total_quantized += quantized.nbytes + 8  # +8 for scale and zero_point
+
+        # Store NaN mask so we can restore NaN positions during decompression
+        nan_mask_bytes = nan_mask.tobytes() if num_nan > 0 else b''
+        nan_mask_shape = arr.shape if num_nan > 0 else ()
 
         quantized_data[name] = {
             'quantized': quantized,
@@ -193,6 +221,9 @@ def compress_quantize(grad_dict: Dict[str, torch.Tensor], bits: int = 8) -> Dict
             'zero_point': int(zero_point),
             'shape': arr.shape,
             'dtype': str(dtype),
+            'nan_mask': nan_mask_bytes,
+            'nan_mask_shape': nan_mask_shape,
+            'nan_count': int(num_nan),
         }
 
     compression_ratio = total_original / max(total_quantized, 1)
@@ -233,8 +264,20 @@ def decompress_quantize(quantized_dict: Dict[str, Any]) -> Dict[str, torch.Tenso
         else:
             flat = np.frombuffer(bytes(quantized), dtype=q_info.get('dtype', 'uint8')).astype(np.float32)
 
-        # Dequantize
-        dequantized = (flat - zero_point) * scale
+        # Dequantize in float64 to avoid overflow with extreme values
+        # (float32 has max ~3.4e38, but intermediate (val-zero)*scale can overflow
+        #  when scale ~1e27 and val ~1e30, even though result fits in float32)
+        dequantized = ((flat.astype(np.float64) - zero_point) * float(scale)).astype(np.float32)
+
+        # Restore NaN positions if we stored a NaN mask
+        nan_mask_bytes = q_info.get('nan_mask', b'')
+        nan_count = q_info.get('nan_count', 0)
+        nan_mask_shape = q_info.get('nan_mask_shape', shape)
+        if nan_count > 0 and nan_mask_bytes:
+            # Use uint8 for cross-platform-safe mask deserialization (np.bool_ is deprecated)
+            nan_mask = np.frombuffer(nan_mask_bytes, dtype=np.uint8).astype(np.bool_)
+            nan_mask = nan_mask.reshape(nan_mask_shape).flatten()
+            dequantized[nan_mask] = float('nan')
 
         # Reshape to original shape
         result[name] = torch.from_numpy(dequantized.reshape(shape))

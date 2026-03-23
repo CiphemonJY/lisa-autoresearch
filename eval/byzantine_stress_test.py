@@ -285,6 +285,10 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
+        # Option 3 fix: lora_B = zero (standard LoRA init).
+        # Standard LoRA: BA must start at 0 so the model IS the original pretrained model.
+        # lora_A random std=0.01, lora_B = 0. With B=0, BA=0 and no perturbation.
+        # lora_B then grows from gradients during training.
         self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
@@ -603,12 +607,15 @@ def aggregate_deltas(
     else:
         raise ValueError(f"Unknown Byzantine method: {byzantine_method}")
 
-    # Apply accumulated delta to server model - scale by SERVER_LR so the
-    # aggregated multi-step gradient doesn't catastrophically diverge the model.
-    SERVER_LR = 0.1
+    # Apply accumulated delta to server model - scale by adaptive SERVER_LR.
+    # Option 4: Adaptive SERVER_LR based on delta magnitude.
+    # delta_norm = ||delta||_F, then SERVER_LR = min(0.1, 0.01 / delta_norm).
+    # This keeps the update O(0.01) regardless of delta magnitude.
+    delta_norm = math.sqrt(sum(v.float().pow(2).sum().item() for v in acc.values()))
+    SERVER_LR = min(0.1, 0.01 / delta_norm) if delta_norm > 1e-8 else 0.1
     # DEBUG: log aggregation magnitude
     _dbg_norms = [v.float().norm().item() for v in acc.values()]
-    logger.info(f"  [AGG] acc norm avg={sum(_dbg_norms)/len(_dbg_norms):.6f} max={max(_dbg_norms):.6f} SERVER_LR={SERVER_LR}")
+    logger.info(f"  [AGG] acc norm avg={sum(_dbg_norms)/len(_dbg_norms):.6f} max={max(_dbg_norms):.6f} SERVER_LR={SERVER_LR:.6f} (delta_norm={delta_norm:.6f})")
     for full_name, lora_layer in wrapper.lora_layers.items():
         for suffix in ["lora_A", "lora_B"]:
             key = f"{full_name}.{suffix}"
@@ -684,6 +691,11 @@ def run_byzantine_experiment(
     logger.info("\n[SETUP] Applying LoRA...")
     wrapper = LoraAppliedModel(model, rank=LORA_RANK, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
     wrapper.apply_lora()
+
+    # DEBUG: check ppl BEFORE any training
+    logger.info("\n[DEBUG] ppl BEFORE training (after LoRA init)...")
+    ppl_before = compute_perplexity(model, test_enc)
+    logger.info(f"  ppl = {ppl_before:.2e}")
 
     # -------------------------------------------------------------------------
     # Federated loop

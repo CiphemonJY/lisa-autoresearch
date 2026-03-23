@@ -520,7 +520,7 @@ def compute_perplexity(model: nn.Module, test_enc: Dict[str, torch.Tensor],
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    pad_token_id = tokenizer.pad_token_id
+    pad_token_id = model.config.pad_token_id if model.config.pad_token_id is not None else 0
     n_batches = min((len(test_enc["input_ids"]) + batch_size - 1) // batch_size, MAX_TEST_BATCHES)
     for i in range(n_batches):
         start = i * batch_size

@@ -33,7 +33,7 @@ LISA_MIDDLE = 2
 MAX_TRAIN_BATCHES_PER_CLIENT = 20   # Same cap as byzantine
 MAX_TEST_BATCHES = 20
 SEED = 42
-SERVER_LR = 0.1          # Same as byzantine
+SERVER_LR = 0.1          # Will be overridden by adaptive formula below
 
 # ---------------------------------------------------------------------------
 # LoRA - EXACT copy from byzantine_stress_test.py (LoRALinear + LoraAppliedModel)

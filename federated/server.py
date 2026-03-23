@@ -1415,11 +1415,25 @@ if FASTAPI_AVAILABLE:
         client_id = body.get("client_id")
         if not client_id:
             raise HTTPException(status_code=400, detail="client_id required")
+        # Bearer-token auth: validate if server has auth_token configured
+        auth_token = _server.config.get("auth_token")
+        if auth_token:
+            auth_header = request.headers.get("Authorization", "")
+            expected = f"Bearer {auth_token}"
+            if not secrets.compare_digest(auth_header, expected):
+                raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing auth token")
         return _server.register_client(client_id)
 
     @app.post("/submit")
     async def submit(request: Request):
         body = await request.json()
+        # Bearer-token auth: validate if server has auth_token configured
+        auth_token = _server.config.get("auth_token")
+        if auth_token:
+            auth_header = request.headers.get("Authorization", "")
+            expected = f"Bearer {auth_token}"
+            if not secrets.compare_digest(auth_header, expected):
+                raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing auth token")
         return _server.receive_gradient(body)
 
     @app.get("/model/{client_id}")
@@ -1438,6 +1452,48 @@ if FASTAPI_AVAILABLE:
         if not status:
             raise HTTPException(status_code=404, detail="Round not found")
         return status
+
+    @app.post("/disconnect")
+    async def disconnect(request: Request):
+        """
+        Graceful disconnect: client signals it is leaving.
+        Marks the client as inactive and logs the event.
+        """
+        body = await request.json()
+        client_id = body.get("client_id", "unknown")
+        round_num = body.get("round_number", 0)
+
+        # Auth check (if server has auth_token configured)
+        auth_token = _server.config.get("auth_token")
+        if auth_token:
+            auth_header = request.headers.get("Authorization", "")
+            expected = f"Bearer {auth_token}"
+            if not secrets.compare_digest(auth_header, expected):
+                raise HTTPException(status_code=401, detail="Unauthorized")
+
+        with _server._get_lock():
+            if client_id in _server.clients:
+                _server.clients[client_id].is_active = False
+                _server.clients[client_id].last_seen = time.time()
+                _server.metrics.active_clients = max(0, _server.metrics.active_clients - 1)
+
+            # Mark client as disconnected in the current round if applicable
+            if round_num > 0 and round_num in _server.round_state:
+                rs = _server.round_state[round_num]
+                if client_id not in rs.clients_disconnected:
+                    rs.clients_disconnected.append(client_id)
+                    if client_id in rs.clients_joined:
+                        rs.clients_joined.remove(client_id)
+
+        _server.audit_logger.log_event(
+            event_type="client_disconnect",
+            client_id=client_id,
+            success=True,
+            epoch=str(round_num),
+        )
+        logger.info(f"[{client_id}] Client disconnected gracefully (round {round_num})")
+
+        return {"status": "disconnected", "client_id": client_id}
 
 
 # ============================================================================

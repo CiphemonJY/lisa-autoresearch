@@ -609,10 +609,12 @@ class FederatedClient:
     def __init__(self, client_id: str, server_url: str = "http://localhost:8000",
                  config: Optional[Dict] = None,
                  p2p_enabled: bool = False,
-                 bootstrap_server: Optional[str] = None):
+                 bootstrap_server: Optional[str] = None,
+                 auth_token: Optional[str] = None):
         self.client_id = client_id
         self.server_url = server_url.rstrip("/")
         self.config = {**DEFAULT_CONFIG, **(config or {})}
+        self.auth_token = auth_token
 
         self.state = ClientState(client_id=client_id)
         self.trainer = LocalTrainer(client_id, self.config)
@@ -716,12 +718,17 @@ class FederatedClient:
                 "dp_epsilon": update.dp_epsilon,
                 "gradient_data": base64.b64encode(update.compressed_data).decode("utf-8"),
             }
-            
+
+            headers = {}
+            if self.auth_token:
+                headers["Authorization"] = f"Bearer {self.auth_token}"
+
             # Send metadata first
             meta_resp = requests.post(
                 f"{self.server_url}/submit",
                 json=payload,
                 timeout=30,
+                headers=headers,
             )
             
             if meta_resp.status_code == 200:
@@ -748,7 +755,45 @@ class FederatedClient:
         except Exception as e:
             logger.error(f"Submit failed: {e}")
             return {"status": "error", "message": str(e)}
-    
+
+    def disconnect(self) -> Dict:
+        """
+        Notify the server that this client is disconnecting.
+
+        Sends a graceful /disconnect POST so the server can mark the client
+        inactive and exclude it from future rounds without waiting for a timeout.
+        """
+        import requests
+
+        if not self.auth_token:
+            logger.info(f"[{self.client_id}] No auth token set; skipping server disconnect notification")
+            return {"status": "skipped"}
+
+        try:
+            headers = {"Authorization": f"Bearer {self.auth_token}"}
+            payload = {
+                "client_id": self.client_id,
+                "round_number": self.state.round_number,
+            }
+            resp = requests.post(
+                f"{self.server_url}/disconnect",
+                json=payload,
+                timeout=10,
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                logger.info(f"[{self.client_id}] Server notified of disconnect")
+                return resp.json()
+            else:
+                logger.warning(f"[{self.client_id}] Server disconnect notification failed: {resp.status_code}")
+                return {"status": "error", "message": resp.text}
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[{self.client_id}] Could not notify server (unreachable)")
+            return {"status": "error", "message": "server_unreachable"}
+        except Exception as e:
+            logger.error(f"[{self.client_id}] Disconnect notification failed: {e}")
+            return {"status": "error", "message": str(e)}
+
     def run_rounds(self, num_rounds: int, server_url: Optional[str] = None):
         """Run multiple federated rounds."""
         if server_url:
@@ -766,7 +811,10 @@ class FederatedClient:
             # Wait between rounds
             if r < num_rounds:
                 time.sleep(2)
-        
+
+        # Notify server we're done
+        self.disconnect()
+
         logger.info(
             f"Completed {num_rounds} rounds. "
             f"Total samples: {self.state.total_samples_trained:,}"
@@ -807,6 +855,11 @@ def main():
             "python -m federated.p2p --bootstrap --port 8081"
         ),
     )
+    parser.add_argument(
+        "--auth-token",
+        default=None,
+        help="Optional auth token for client authentication with the server",
+    )
     
     args = parser.parse_args()
     
@@ -831,6 +884,7 @@ def main():
         config,
         p2p_enabled=args.p2p_enable,
         bootstrap_server=args.bootstrap_server,
+        auth_token=args.auth_token,
     )
     client.run_rounds(args.rounds)
 

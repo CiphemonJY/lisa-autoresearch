@@ -36,7 +36,7 @@ lisa-train = "main:main"
 
 [tool.setuptools]
 py-modules = ["fed_client", "main"]
-packages = ["federated"]
+packages = ["federated", "lisa", "utils", "api"]
 
 [tool.black]
 line-length = 100

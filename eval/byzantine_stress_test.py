@@ -57,7 +57,7 @@ logger = logging.getLogger("eval")
 # Config
 # ---------------------------------------------------------------------------
 MODEL_ID = "EleutherAI/pythia-70m"
-NUM_CLIENTS = 3
+NUM_CLIENTS = 5
 NUM_ROUNDS = 3
 LOCAL_EPOCHS = 1
 BATCH_SIZE = 4
@@ -85,30 +85,59 @@ TRIMMED_MEAN_TRIM = 0.1        # fraction to trim from each tail (10%)
 # ---------------------------------------------------------------------------
 
 def byzantine_norm_filter(deltas: List[Dict[str, torch.Tensor]],
-                           weights: List[float]) -> Tuple[List[Dict[str, torch.Tensor]], List[float]]:
+                           weights: List[float],
+                           sigma_threshold: float = 3.0) -> Tuple[List[Dict[str, torch.Tensor]], List[float]]:
     """
     Compute L2 norm of each client's aggregated delta.
-    Reject any client whose norm lies beyond 3 standard deviations from the mean.
+    Uses Median Absolute Deviation (MAD) for robust outlier detection.
+    MAD is robust to Byzantine outliers unlike mean/std which are dominated by them.
     """
     norms = []
     for delta in deltas:
         n = math.sqrt(sum(v.float().pow(2).sum().item() for v in delta.values()))
         norms.append(n)
 
+    n = len(norms)
     norms_arr = np.array(norms)
-    mean_n = norms_arr.mean()
-    std_n = norms_arr.std()
-    logger.info(f"    [norm-filter] norms={norms} mean={mean_n:.4f} std={std_n:.4f}")
+    sorted_norms = np.sort(norms_arr)
+    median_n = sorted_norms[n // 2] if n % 2 == 1 else (sorted_norms[n // 2 - 1] + sorted_norms[n // 2]) / 2
 
-    if std_n < 1e-8:
-        return deltas, weights
+    # Median Absolute Deviation (MAD) - robust to outliers
+    abs_devs = np.abs(norms_arr - median_n)
+    sorted_devs = np.sort(abs_devs)
+    mid_d = n // 2
+    mad = sorted_devs[mid_d] if n % 2 == 1 else (sorted_devs[mid_d - 1] + sorted_devs[mid_d]) / 2
 
-    keep_indices = [i for i, n in enumerate(norms)
-                    if abs(n - mean_n) <= 3 * std_n]
+    # Modified z-score threshold
+    # Constant 0.6745 maps MAD to std under normal distribution
+    # Modified z-score = 0.6745 * |x - median| / MAD
+    if mad < 1e-10:
+        # All norms essentially identical
+        threshold = median_n
+        outlier_mask = np.zeros(n, dtype=bool)
+    else:
+        modified_z = 0.6745 * abs_devs / mad
+        outlier_mask = modified_z > sigma_threshold
+        # Compute threshold in original norm space for logging
+        threshold = median_n + sigma_threshold * (mad / 0.6745)
 
-    dropped = set(range(len(deltas))) - set(keep_indices)
+    # Log diagnostics
+    if mad < 1e-10:
+        mad_display = "identical"
+        z_scores = ["0.0"] * n
+    else:
+        mad_display = f"{mad:.4f}"
+        z_scores = [f"{0.6745 * abs_devs[i] / mad:.2f}" for i in range(n)]
+    logger.info(f"    [norm-filter] norms={[f'{x:.4f}' for x in norms]}")
+    logger.info(f"    [norm-filter] median={median_n:.4f} MAD={mad_display}")
+    logger.info(f"    [norm-filter] threshold={threshold:.4f} z_scores={z_scores}")
+
+    keep_indices = [i for i in range(n) if not outlier_mask[i]]
+
+    dropped = set(range(n)) - set(keep_indices)
     if dropped:
-        logger.info(f"    [norm-filter] DROPPED clients: {dropped}")
+        dropped_norms = [norms[i] for i in dropped]
+        logger.info(f"    [norm-filter] DROPPED clients: {dropped} (norms={dropped_norms})")
 
     return [deltas[i] for i in keep_indices], [weights[i] for i in keep_indices]
 
@@ -124,13 +153,20 @@ def byzantine_krum(deltas: List[Dict[str, torch.Tensor]],
     Compute the Multi-Krum aggregation.
     Score each client by summed squared distances to its f-nearest neighbours.
     Keep the n - f - 1 clients with lowest scores, then average.
+
+    Bug fixes from original:
+    - Guard was n <= 2*f+1 (wrong: allows n=2f+1 which is too few).
+      Correct minimum: n >= 2f+3. We fall back when n < 2f+3.
+    - k (neighbors) and n_keep could be 0 or negative for tiny n; clamp with max().
     """
     n = len(deltas)
     f = n_malicious
 
-    if n <= 2 * f + 1:
-        logger.warning(f"    [krum] Not enough clients ({n}) for f={f} malicious. Falling back to mean.")
-        # Fallback: weighted average
+    # Correct viability check: need n >= 2f+3 for Krum to work properly.
+    # If fewer clients, fall back to simple averaging (which is all we can do).
+    if n < 2 * f + 3:
+        logger.warning(f"    [krum] Not enough clients ({n}) for f={f} malicious "
+                       f"(need n>=2f+3={2*f+3}). Falling back to weighted mean.")
         acc: Dict[str, torch.Tensor] = {}
         for delta, w in zip(deltas, weights):
             for k, v in delta.items():
@@ -141,7 +177,6 @@ def byzantine_krum(deltas: List[Dict[str, torch.Tensor]],
         return acc, 1.0
 
     # Compute pairwise squared distances between clients based on flattened delta vectors
-    # Use cosine-similarity-inspired approach: dot product of flattened vectors
     def flatten_delta(d):
         vals = []
         for v in sorted(d.keys()):
@@ -150,28 +185,37 @@ def byzantine_krum(deltas: List[Dict[str, torch.Tensor]],
 
     flat_deltas = [flatten_delta(d) for d in deltas]
 
-    # Compute pairwise Euclidean distances
+    # Compute pairwise Euclidean distances and Krum scores
+    # score_i = sum of squared distances to k nearest neighbors (excluding self)
+    k = max(1, n - f - 2)  # number of nearest neighbors to consider
+    n_keep = max(1, n - f - 1)  # number of clients to keep
+
     scores = []
+    all_dists = []  # for debug logging
     for i in range(n):
         dists = []
         for j in range(n):
             if i == j:
                 continue
             d = (flat_deltas[i] - flat_deltas[j]).pow(2).sum().item()
-            dists.append(d)
-        dists.sort()
-        # Sum distances to f nearest neighbours
-        score = sum(dists[:f])
+            dists.append((j, d))
+        dists.sort(key=lambda x: x[1])
+        # Sum squared distances to k nearest neighbours
+        score = sum(d for _, d in dists[:k])
         scores.append(score)
+        all_dists.append(dists[:k])
 
-    logger.info(f"    [krum] scores={scores}")
+    logger.info(f"    [krum] n={n} f={f} k={k} n_keep={n_keep}")
+    logger.info(f"    [krum] scores={[f'{s:.4f}' for s in scores]}")
 
     # Keep n - f - 1 clients with lowest scores
-    n_keep = n - f - 1
     sorted_indices = sorted(range(n), key=lambda i: scores[i])
     keep_indices = sorted_indices[:n_keep]
+    selected_client = keep_indices[0]  # primary selected client for logging
 
-    logger.info(f"    [krum] keeping clients: {keep_indices} (dropped {set(range(n)) - set(keep_indices)})")
+    logger.info(f"    [krum] keeping clients: {keep_indices} "
+                f"(dropped {set(range(n)) - set(keep_indices)})")
+    logger.info(f"    [krum] primary selected client: {selected_client}")
 
     # Weighted average of kept deltas
     total_w = sum(weights[i] for i in keep_indices)
@@ -347,10 +391,17 @@ class LoraAppliedModel:
         return count
 
     def freeze_all(self):
+        """Freeze all model parameters (including LoRA layers)."""
         for param in self.model.parameters():
             param.requires_grad = False
 
     def unfreeze_lora_layers(self, layer_indices: List[int]):
+        """
+        Unfreeze BOTH lora_A and lora_B for selected layers.
+        FIX: Both A and B must be trainable for meaningful gradient updates.
+        With B starting at zero, A alone produces near-zero output and the
+        model cannot learn. B must also receive gradients to grow from zero.
+        """
         patterns = []
         for idx in layer_indices:
             patterns.extend([f"gpt_neox.layers.{idx}.", f".h.{idx}."])
@@ -362,9 +413,13 @@ class LoraAppliedModel:
                     break
 
     def unfreeze_lora_A_only(self, layer_indices: Optional[List[int]] = None):
-        """Unfreeze only lora_A (not lora_B) for selected layers.
-        This prevents lora_B — which starts at zero — from receiving large
-        gradient updates that catastrophically perturb the model output."""
+        """
+        DEPRECATED / FOR DEBUG ONLY.
+        Unfreezing only lora_A is incorrect for actual training because
+        lora_B stays frozen at zero, making lora_A @ lora_B = 0 regardless of A.
+        Use unfreeze_lora_layers() which unfreezes both A and B.
+        This method is kept only for experimental comparison.
+        """
         if layer_indices is None:
             for lora_layer in self.lora_layers.values():
                 lora_layer.lora_A.requires_grad = True
@@ -530,6 +585,13 @@ def compute_deltas(before: Dict[str, torch.Tensor],
 def train_client(model: nn.Module, tokenizer, wrapper: LoraAppliedModel,
                  client_texts: List[str], round_num: int, client_id: str,
                  selected_layers: Optional[List[int]] = None) -> Dict[str, Any]:
+    """
+    Train LoRA layers locally on client texts.
+    FIX: unfreeze_lora_layers() now unfreezes BOTH lora_A and lora_B.
+    Previously unfreeze_lora_layers only unfroze A (via a different code path
+    in unfreeze_lora_A_only which was called by mistake). With B frozen at zero,
+    lora_A @ lora_B = 0 and no learning occurred.
+    """
     wrapper.freeze_all()
     if selected_layers is None:
         for lora_layer in wrapper.lora_layers.values():
@@ -545,6 +607,7 @@ def train_client(model: nn.Module, tokenizer, wrapper: LoraAppliedModel,
 
     losses = []
     n_batches = min((len(enc["input_ids"]) + BATCH_SIZE - 1) // BATCH_SIZE, MAX_TRAIN_BATCHES_PER_CLIENT)
+    _debug_first = True
 
     for _ in range(LOCAL_EPOCHS):
         indices = torch.randperm(len(enc["input_ids"])).tolist()
@@ -559,6 +622,12 @@ def train_client(model: nn.Module, tokenizer, wrapper: LoraAppliedModel,
             if torch.isnan(loss):
                 continue
             loss.backward()
+            if _debug_first and round_num == 1:
+                grad_norms = {f"{fn}.lora_B": ll.lora_B.grad.norm().item()
+                              for fn, ll in wrapper.lora_layers.items()
+                              if ll.lora_B.grad is not None and ll.lora_B.grad.norm().item() > 1e-10}
+                logger.info(f"  [DEBUG] {client_id} lora_B grads: {len(grad_norms)} non-zero {list(grad_norms.keys())[:3]}")
+                _debug_first = False
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             losses.append(loss.item())
@@ -626,12 +695,23 @@ def aggregate_deltas(
     else:
         raise ValueError(f"Unknown Byzantine method: {byzantine_method}")
 
-    # Apply accumulated delta to server model - scale by adaptive SERVER_LR.
-    # Option 4: Adaptive SERVER_LR based on delta magnitude.
-    # delta_norm = ||delta||_F, then SERVER_LR = min(0.1, 0.01 / delta_norm).
-    # This keeps the update O(0.01) regardless of delta magnitude.
+    # FIX: Sanitize accumulated deltas before computing norm or applying.
+    # NaN/Inf can arise from dtype mismatches (float32 delta + bfloat16 model).
+    for k in acc:
+        acc[k] = acc[k].nan_to_num(nan=0.0, posinf=1e4, neginf=-1e4)
+        # Clamp to prevent extreme values from destabilizing the model
+        acc[k] = torch.clamp(acc[k], min=-10.0, max=10.0)
+
+    # Apply accumulated delta to server model.
+    # FIX: Use SERVER_LR=1.0 (the natural choice) UNLESS delta_norm is
+    # very large (indicating a potential Byzantine attack or numerical issue).
+    # The old formula: SERVER_LR = min(0.1, 0.01/delta_norm) was backwards —
+    # it made the update TOO SMALL when deltas were small (normal training)
+    # and could make SERVER_LR=0.1 even for moderately-sized legitimate updates.
     delta_norm = math.sqrt(sum(v.float().pow(2).sum().item() for v in acc.values()))
-    SERVER_LR = min(0.1, 0.01 / delta_norm) if delta_norm > 1e-8 else 0.1
+    # Cap SERVER_LR at 1.0 to prevent runaway updates; in practice 1.0 works
+    # because deltas are the parameter updates (not raw gradients).
+    SERVER_LR = min(1.0, 0.1 / math.sqrt(max(delta_norm, 1e-8))) if delta_norm > 1e-6 else 1.0
     # DEBUG: log aggregation magnitude
     _dbg_norms = [v.float().norm().item() for v in acc.values()]
     logger.info(f"  [AGG] acc norm avg={sum(_dbg_norms)/len(_dbg_norms):.6f} max={max(_dbg_norms):.6f} SERVER_LR={SERVER_LR:.6f} (delta_norm={delta_norm:.6f})")

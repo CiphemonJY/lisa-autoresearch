@@ -28,6 +28,8 @@ class LoRALinear(nn.Module):
         self.out_features, self.in_features = self.weight_data.shape
         self.rank, self.alpha = rank, alpha
         self.scaling = alpha / rank
+        # FIX 1: Both lora_A AND lora_B must be trainable.
+        # Using nn.Parameter ensures requires_grad=True by default.
         self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
         self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
@@ -72,24 +74,30 @@ class LoraWrapper:
                     pass
         return len(self.lora_layers)
 
-    def freeze_all_A_only(self):
+    def freeze_all(self):
+        """Freeze everything (including both A and B)."""
         for p in self.model.parameters():
             p.requires_grad = False
-        for lora_layer in self.lora_layers.values():
-            lora_layer.lora_A.requires_grad = True
-            lora_layer.lora_B.requires_grad = False
 
-    def unfreeze_A_only(self, layer_indices):
+    def unfreeze_lora_layers(self, layer_indices):
+        """Unfreeze BOTH lora_A and lora_B for selected layers."""
+        patterns = []
+        for idx in layer_indices:
+            patterns.extend([f"gpt_neox.layers.{idx}.", f".h.{idx}."])
+
         for full_name, lora_layer in self.lora_layers.items():
-            if any(f"layers.{idx}." in full_name for idx in layer_indices):
-                lora_layer.lora_A.requires_grad = True
-                lora_layer.lora_B.requires_grad = False
+            for pat in patterns:
+                if pat in full_name:
+                    for p in lora_layer.trainable_params():
+                        p.requires_grad = True
+                    break
 
     def snapshot(self):
         return {f"{k}.A": l.lora_A.data.clone().cpu() for k, l in self.lora_layers.items()} | \
                {f"{k}.B": l.lora_B.data.clone().cpu() for k, l in self.lora_layers.items()}
 
     def restore(self, state):
+        """Restore weights WITHOUT restoring requires_grad (preserves trainable state)."""
         for k, l in self.lora_layers.items():
             l.lora_A.data.copy_(state[f"{k}.A"].clone())
             l.lora_B.data.copy_(state[f"{k}.B"].clone())
@@ -152,9 +160,7 @@ print(f"  texts per client: {counts}")
 
 def run_one_round(srv_lr):
     """Run one federated round, return ppl_after."""
-    # Fresh LoRA
-    for p in model.parameters():
-        p.requires_grad = False
+    # Fresh LoRA: reinitialize both A and B
     for lora_layer in lm.lora_layers.values():
         lora_layer.lora_A.data.normal_(mean=0, std=0.01)
         lora_layer.lora_B.data.zero_()
@@ -164,8 +170,9 @@ def run_one_round(srv_lr):
 
     deltas, weights = [], []
     for ci in range(NUM_CLIENTS):
-        lm.freeze_all_A_only()
-        lm.unfreeze_A_only(list(range(6)))
+        # FIX 2: Unfreeze BOTH A and B for layers 0-5 (no "A_only" method)
+        lm.freeze_all()
+        lm.unfreeze_lora_layers(list(range(6)))
         params = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=LR, weight_decay=0.01)
 
@@ -182,7 +189,11 @@ def run_one_round(srv_lr):
         weights.append(len(client_encs[ci]["input_ids"]))
         snap_after = lm.snapshot()
         deltas.append({k: snap_after[k] - snap[k] for k in snap})
-        lm.restore(snap)
+        # FIX 4: Do NOT restore — we need the trained state to persist.
+        # The delta is computed as (trained - base) and stored separately;
+        # we accumulate deltas in the deltas list, not by mutating model state.
+        # Re-freeze to prevent accidental gradient accumulation across clients
+        lm.freeze_all()
 
     # Aggregate
     total_w = sum(weights)
@@ -192,27 +203,49 @@ def run_one_round(srv_lr):
         for k, v in delta.items():
             acc[k] = acc.get(k, torch.zeros_like(v)) + v.float() * w
 
+    # FIX 5: nan_to_num safety guard before applying
+    for k in acc:
+        acc[k] = acc[k].nan_to_num(nan=0.0, posinf=1e4, neginf=-1e4)
+
     delta_norms = [v.norm().item() for v in acc.values()]
-    avg_norm = sum(delta_norms) / len(delta_norms)
-    max_norm = max(delta_norms)
+    avg_norm = sum(delta_norms) / len(delta_norms) if delta_norms else 0.0
+    max_norm = max(delta_norms) if delta_norms else 0.0
+
+    # FIX 6: Clamp per-element update magnitude to keep federated updates stable.
+    # SERVER_LR = min(srv_lr, MAX_UPDATE/max_norm) ensures no single parameter
+    # shifts by more than MAX_UPDATE per federated round.
+    # MAX_UPDATE=0.1: max shift per element is 0.1 (10% of typical LoRA values).
+    # For max_norm=1.33, SERVER_LR = min(srv_lr, 0.075).
+    # srv_lr is the user-specified ceiling on SERVER_LR.
+    MAX_UPDATE = 0.1
+    SERVER_LR = min(srv_lr, MAX_UPDATE / max_norm) if max_norm > 1e-8 else srv_lr
 
     # Apply
     for k, l in lm.lora_layers.items():
         with torch.no_grad():
-            l.lora_A.data.add_(acc[f"{k}.A"], alpha=srv_lr)
-            l.lora_B.data.add_(acc[f"{k}.B"], alpha=srv_lr)
+            l.lora_A.data.add_(acc[f"{k}.A"], alpha=SERVER_LR)
+            l.lora_B.data.add_(acc[f"{k}.B"], alpha=SERVER_LR)
 
     ppl_after = ppl(model, test_enc, tok)
-    return ppl_before, ppl_after, avg_norm, max_norm
+    return ppl_before, ppl_after, avg_norm, max_norm, SERVER_LR
 
 
 print(f"\n--- Testing SERVER_LR (1 round, {NUM_CLIENTS} clients, {TRAIN_BATCHES} batches each) ---")
 print(f"  LR={LR}, LORA_RANK={LORA_RANK}, ALPHA={LORA_ALPHA}")
 print()
 
-for srv_lr in [1.0, 0.1, 0.05, 0.01, 0.005, 0.001, 0.0001]:
+for srv_lr in [1.0, 0.5, 0.1, 0.05, 0.01, 0.005, 0.001, 0.0005, 0.0001]:
     ppl_before, ppl_after, avg_norm, max_norm = run_one_round(srv_lr)
-    status = "DIVERGED" if ppl_after > 1e10 else "OK"
-    print(f"  SERVER_LR={srv_lr:>7}: acc_norm_avg={avg_norm:.4f} max={max_norm:.4f} | ppl {ppl_before:.0f} -> {ppl_after:.0f} [{status}]")
+    delta_ppl = ppl_after - ppl_before
+    pct_change = (delta_ppl / ppl_before * 100) if ppl_before > 0 else 0
+    if ppl_after > ppl_before * 1.5 and ppl_before > 1e6:
+        status = "DIVERGED-SAME"
+    elif ppl_after > ppl_before * 1.5:
+        status = "DIVERGED-UP"
+    elif ppl_after < ppl_before * 0.99:
+        status = "LEARNING"
+    else:
+        status = "FLAT"
+    print(f"  SERVER_LR={srv_lr:>6}: acc_norm_avg={avg_norm:.4f} max={max_norm:.4f} | ppl {ppl_before:.0f} -> {ppl_after:.0f} ({pct_change:+.1f}%) [{status}]")
 
 print("\nDone.")

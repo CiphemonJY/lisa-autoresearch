@@ -424,12 +424,19 @@ def aggregate_deltas(
         for k, v in delta.items():
             acc[k] = acc.get(k, torch.zeros_like(v)) + v.float() * w
 
-    # Apply to server model — scale by adaptive SERVER_LR.
-    # Option 4: Adaptive SERVER_LR based on delta magnitude.
-    # delta_norm = ||delta||_F, then SERVER_LR = min(0.1, 0.01 / delta_norm).
-    # This keeps the update O(0.01) regardless of delta magnitude.
+    # FIX: Sanitize deltas — NaN/Inf can arise from dtype mismatches
+    # (float32 LoRA params + bfloat16/float16 model).
+    for k in acc:
+        acc[k] = acc[k].nan_to_num(nan=0.0, posinf=1e4, neginf=-1e4)
+        acc[k] = torch.clamp(acc[k], min=-10.0, max=10.0)
+
+    # Apply to server model.
+    # FIX: Use SERVER_LR=1.0 (the natural choice when deltas are actual
+    # parameter updates, not raw gradients to be step-scaled).
+    # The old formula SERVER_LR = min(0.1, 0.01/delta_norm) was backwards —
+    # small (normal) deltas got small SERVER_LR, making aggregation ineffective.
     delta_norm = math.sqrt(sum(v.float().pow(2).sum().item() for v in acc.values()))
-    SERVER_LR = min(0.1, 0.01 / delta_norm) if delta_norm > 1e-8 else 0.1
+    SERVER_LR = min(1.0, 0.1 / math.sqrt(max(delta_norm, 1e-8))) if delta_norm > 1e-6 else 1.0
     for full_name, lora_layer in wrapper.lora_layers.items():
         for suffix in ["lora_A", "lora_B"]:
             key = f"{full_name}.{suffix}"

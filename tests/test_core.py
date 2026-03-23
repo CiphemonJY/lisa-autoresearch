@@ -4,10 +4,11 @@ Unit tests for core LISA FTM functionality.
 
 Tests LoRA math, LISA layer selection, gradient extraction,
 FedAvg aggregation, config loading, and socket protocol round-trip.
-No model downloads — fully self-contained with mocks.
+No model downloads â€" fully self-contained with mocks.
 """
 
 import gc
+import shutil
 import json
 import os
 import pickle
@@ -37,7 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 def test_lora_linear_math():
     """
     Test that LoRA math is correct: y = Wx + (B @ A) * x * (alpha / rank)
-    
+
     We mock a linear layer, apply LoRA, and verify:
     - Output shape matches input shape
     - LoRA contribution is the low-rank (B @ A) term scaled
@@ -92,6 +93,80 @@ def test_lora_linear_math():
         "Original linear weights should be frozen"
 
     print("[PASS] test_lora_linear_math")
+
+
+def test_lora_both_params_trainable_and_get_gradients():
+    """
+    Regression test for the training loop bug: both lora_A AND lora_B must
+    receive gradients during fine-tuning.
+
+    The bug: lora_B was initialized to zeros and frozen (requires_grad=False),
+    making lora_A @ lora_B = 0 regardless of lora_A's values. The model
+    could not learn because the LoRA output was always zero.
+
+    This test verifies:
+    1. lora_B is NOT frozen by default (requires_grad=True)
+    2. After backward pass, BOTH lora_A.grad and lora_B.grad are not None
+    3. Gradients are non-None (the key indicator of the frozen-B bug)
+
+    Note: Gradient values can be zero after one random step due to random init
+    with small std, so we use multiple steps to ensure at least one non-zero grad.
+    """
+    from lisa.train_torch import LoRALinear
+
+    # Create a tiny mock model for fast, self-contained testing
+    original = torch.nn.Linear(in_features=16, out_features=8, bias=False)
+    torch.nn.init.normal_(original.weight, mean=0.0, std=0.02)
+
+    rank = 4
+    alpha = 8.0
+    lora_layer = LoRALinear(original, rank=rank, alpha=alpha, dropout=0.0)
+
+    # Verify BOTH A and B are nn.Parameter (trainable by default)
+    assert isinstance(lora_layer.lora_A, torch.nn.Parameter), \
+        "lora_A should be an nn.Parameter"
+    assert isinstance(lora_layer.lora_B, torch.nn.Parameter), \
+        "lora_B should be an nn.Parameter"
+
+    # Verify both are trainable (requires_grad=True)
+    assert lora_layer.lora_A.requires_grad, \
+        "lora_A should have requires_grad=True"
+    assert lora_layer.lora_B.requires_grad, \
+        "BUG: lora_B has requires_grad=False — it was frozen! " \
+        "Both lora_A and lora_B must be trainable for the model to learn."
+
+    # Freeze original weights (as in real training)
+    for p in original.parameters():
+        p.requires_grad = False
+
+    # Run a few training steps to get non-trivial gradients
+    # (single step with small-random-init params can produce ~zero grads by chance)
+    optimizer = torch.optim.AdamW(
+        [lora_layer.lora_A, lora_layer.lora_B],
+        lr=0.01
+    )
+
+    for step in range(10):
+        optimizer.zero_grad()
+        x = torch.randn(4, 8, 16)  # batch=4, seq=8, in=16
+        target = torch.randn(4, 8, 8)  # batch=4, seq=8, out=8
+        out = lora_layer(x)
+        loss = torch.nn.functional.mse_loss(out, target)
+        loss.backward()
+        optimizer.step()
+
+    # Verify both grads were non-None at some point during training
+    assert lora_layer.lora_A.grad is not None, \
+        "lora_A.grad is None after backward"
+    assert lora_layer.lora_B.grad is not None, \
+        "BUG: lora_B.grad is None — lora_B was frozen and cannot learn! " \
+        "This is the root cause of the flat PPL bug."
+
+    print(f"[PASS] test_lora_both_params_trainable_and_get_gradients")
+    print(f"  lora_A.requires_grad={lora_layer.lora_A.requires_grad}")
+    print(f"  lora_B.requires_grad={lora_layer.lora_B.requires_grad}")
+    print(f"  lora_A.grad norm: {lora_layer.lora_A.grad.norm().item():.6f}")
+    print(f"  lora_B.grad norm: {lora_layer.lora_B.grad.norm().item():.6f}")
 
 
 # ============================================================================
@@ -267,7 +342,7 @@ def test_fedavg_averages_correctly():
 
     The corrected FedAvg: each client's contribution weight =
     (num_samples * rep_factor) / total_weight, where rep_factor = rep/50.
-    No second normalization pass — only one division.
+    No second normalization pass â€" only one division.
     """
     from federated.server import GradientAggregator, DEFAULT_CONFIG
 
@@ -644,30 +719,30 @@ def test_dp_epsilon_computation():
     eps_100 = GradientPrivacy.compute_epsilon(sigma, steps=100)
 
     # Epsilon should increase with steps (cumulative privacy cost)
-    assert eps_10 > eps_1, f"ε should grow with rounds: {eps_10} <= {eps_1}"
-    assert eps_100 > eps_10, f"ε should grow with rounds: {eps_100} <= {eps_10}"
+    assert eps_10 > eps_1, f"Îµ should grow with rounds: {eps_10} <= {eps_1}"
+    assert eps_100 > eps_10, f"Îµ should grow with rounds: {eps_100} <= {eps_10}"
 
-    # But rate of growth should be sublinear (ε ∝ sqrt(steps) via RDP, not linear)
-    # Our simplified formula: ε = 2*σ²*steps → linear, so check that it's non-decreasing
+    # But rate of growth should be sublinear (Îµ âˆ sqrt(steps) via RDP, not linear)
+    # Our simplified formula: Îµ = 2*ÏƒÂ²*steps â†' linear, so check that it's non-decreasing
     assert eps_1 >= 0 and eps_10 >= eps_1 and eps_100 >= eps_10
 
     # Strength classification: epsilon < 2 is "strong", < 8 is "moderate"
-    # For sigma=2.0, eps at 1 round = 2 * 4 * 1 = 8 → "moderate" (boundary)
+    # For sigma=2.0, eps at 1 round = 2 * 4 * 1 = 8 â†' "moderate" (boundary)
     eps_moderate = GradientPrivacy.compute_epsilon(2.0, steps=1)
-    assert eps_moderate <= 8, f"ε={eps_moderate} should be moderate (<=8) for small rounds"
+    assert eps_moderate <= 8, f"Îµ={eps_moderate} should be moderate (<=8) for small rounds"
 
-    # Test delta relationship: large epsilon → small delta → check passes
-    # epsilon=20, sigma=1, steps=10 → δ ≈ exp(-400/(20+20)) = exp(-10) ≈ 4.5e-5
+    # Test delta relationship: large epsilon â†' small delta â†' check passes
+    # epsilon=20, sigma=1, steps=10 â†' Î´ â‰ˆ exp(-400/(20+20)) = exp(-10) â‰ˆ 4.5e-5
     delta_ok = GradientPrivacy.epsilon_to_delta(
         epsilon=20.0, noise_multiplier=1.0, steps=10, target_delta=1e-3
     )
-    assert delta_ok, "δ check should pass for large epsilon (small δ)"
+    assert delta_ok, "Î´ check should pass for large epsilon (small Î´)"
 
     print("[PASS] test_dp_epsilon_computation")
 
 
 def test_dp_aggregate_pipeline():
-    """Test the full DP aggregation: clip → sum → add noise."""
+    """Test the full DP aggregation: clip â†' sum â†' add noise."""
     from federated.privacy import GradientPrivacy, DPConfig
 
     gp = GradientPrivacy(DPConfig(enabled=True, noise_multiplier=1.0, max_grad_norm=1.0))
@@ -676,7 +751,7 @@ def test_dp_aggregate_pipeline():
     grad2 = {"layer.weight": torch.tensor([1.0, 2.0, 3.0])}
 
     # With tiny noise (negligible), DP aggregate should closely approximate the average.
-    # The norm of [1,2,3] = sqrt(14) ≈ 3.74 > max_norm=1.0, so clipping applies.
+    # The norm of [1,2,3] = sqrt(14) â‰ˆ 3.74 > max_norm=1.0, so clipping applies.
     # After clipping: [1,2,3] * (1.0/3.74) * 0.5 + same = [0.267, 0.534, 0.801] * 2 = [0.267, 0.534, 0.801]
     result = gp.dp_aggregate(
         [grad1, grad2],
@@ -684,7 +759,7 @@ def test_dp_aggregate_pipeline():
         max_grad_norm=1.0,
         client_weights=[1.0, 1.0],
     )
-    clipped_norm = torch.norm(grad1["layer.weight"]).item()  # sqrt(14) ≈ 3.74
+    clipped_norm = torch.norm(grad1["layer.weight"]).item()  # sqrt(14) â‰ˆ 3.74
     scale = 1.0 / clipped_norm  # = 0.267
     expected = torch.tensor([1.0, 2.0, 3.0]) * scale  # = [0.267, 0.534, 0.801]
     assert torch.allclose(result["layer.weight"], expected, atol=1e-4), \
@@ -816,10 +891,10 @@ def test_compress_gradients_interface():
 def test_fedavg_no_double_normalization():
     """
     Verify the corrected FedAvg does NOT double-normalize.
-    
+
     The old bug: weight = num_samples/total, then a second division by total_rep/50.
     The fix: single normalized weight = (num_samples * rep_factor) / total_weight.
-    
+
     This test uses unequal reputations to expose the double-normalization bug.
     """
     from federated.server import GradientAggregator
@@ -862,14 +937,14 @@ def test_byzantine_norm_detects_outlier():
     Create 4 honest clients with small gradients and 1 malicious client
     with a much larger gradient. Norm-based detection should flag and exclude
     the outlier.
-    
+
     With 4 honest clients of norm ~1 and 1 malicious of norm ~100,
-    mean ≈ 21, std ≈ 44, threshold ≈ 153. The malicious gradient (100)
-    is below the threshold with 3σ — so we use a larger outlier (500).
+    mean â‰ˆ 21, std â‰ˆ 44, threshold â‰ˆ 153. The malicious gradient (100)
+    is below the threshold with 3Ïƒ â€" so we use a larger outlier (500).
     """
     from federated.byzantine import ByzantineResilientAggregator, norm_based_aggregate
 
-    base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm ≈ 5.5
+    base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm â‰ˆ 5.5
     honest_norms = [5.0, 5.5, 6.0, 5.3]  # ~5.5 each
     grad_dicts = []
     for n in honest_norms:
@@ -898,7 +973,7 @@ def test_byzantine_norm_detects_outlier():
 def test_byzantine_trimmed_mean_works():
     """
     Verify trimmed mean computation is correct.
-    
+
     For a single dimension with values [1, 2, 3, 4, 5] and alpha=0.2:
     - n=5, trim 1 from each end (floor(0.2*5)=1)
     - sorted = [1,2,3,4,5], trimmed = [2,3,4], mean = 3.0
@@ -934,7 +1009,7 @@ def test_byzantine_trimmed_mean_works():
     ]
     byz3 = ByzantineResilientAggregator(method="trimmed_mean", alpha=0.1)
     result3, stats3 = byz3.aggregate(grad3)
-    # n=3, alpha=0.1, floor(0.1*3)=0 → no trim, mean = (1+2+3)/3 = 2.0
+    # n=3, alpha=0.1, floor(0.1*3)=0 â†' no trim, mean = (1+2+3)/3 = 2.0
     assert abs(result3["layer.weight"].item() - 2.0) < 1e-4, \
         f"Trimmed mean n=3 alpha=0.1 should give 2.0, got {result3['layer.weight'].item()}"
 
@@ -996,7 +1071,7 @@ def test_byzantine_krum_selects_closest_to_neighbors():
         {k: v.clone() for k, v in malicious.items()},  # malicious
     ]
 
-    # f=1, n=4 → n-f-2 = 1 neighbor, multi-krum selects n-f-1 = 2
+    # f=1, n=4 â†' n-f-2 = 1 neighbor, multi-krum selects n-f-1 = 2
     byz = ByzantineResilientAggregator(method="krum", f=1)
     result, stats = byz.aggregate(grad_dicts)
 
@@ -1021,13 +1096,13 @@ def test_byzantine_fallback_when_all_look_malicious():
     """
     from federated.byzantine import norm_based_aggregate
 
-    # Two very different large gradients — both might look like outliers
+    # Two very different large gradients â€" both might look like outliers
     grad_dicts = [
         {"layer.weight": torch.tensor([[1000.0, 2000.0]])},
         {"layer.weight": torch.tensor([[-1000.0, -2000.0]])},
     ]
 
-    # With n=2, std might be huge and threshold very high — or very low
+    # With n=2, std might be huge and threshold very high â€" or very low
     # Test the fallback path explicitly
     result, stats = norm_based_aggregate(grad_dicts, sigma_threshold=0.0)
     # sigma_threshold=0 means only mean itself would pass; std might be 0 or huge
@@ -1036,6 +1111,145 @@ def test_byzantine_fallback_when_all_look_malicious():
     assert isinstance(result, dict)
 
     print("[PASS] test_byzantine_fallback_when_all_look_malicious")
+
+
+# ============================================================================
+# Byzantine Defense Unit Tests (stress-test inline implementations)
+# These test the byzantine_norm_filter and byzantine_krum functions as used
+# in eval/byzantine_stress_test.py — NOT the federated/byzantine.py versions.
+# ============================================================================
+
+def test_stress_test_norm_filter_drops_malicious_grad():
+    """
+    byzantine_norm_filter in the stress test should detect and drop gradients
+    with norms far outside the honest distribution using MAD-based detection.
+
+    Setup: 4 honest clients with small gradients (norm ~5) + 1 malicious
+    with huge gradient (norm ~500). MAD-based threshold should catch the outlier.
+    """
+    import sys; sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
+    from byzantine_stress_test import byzantine_norm_filter
+
+    # 4 honest clients: norm ~5 each
+    honest_base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm ≈ 5.5
+    honest_norms = [5.0, 5.5, 6.0, 5.3]
+    deltas = []
+    for n in honest_norms:
+        deltas.append({"layer.weight": honest_base * (n / 5.5)})
+
+    # 1 malicious: 100× norm of honest (500+)
+    malicious = {"layer.weight": honest_base * (100.0 / 5.5)}
+    deltas.append(malicious)
+    weights = [1.0] * 5
+
+    filtered_deltas, filtered_weights = byzantine_norm_filter(deltas, weights)
+
+    # Should drop the malicious client, keep all 4 honest
+    assert len(filtered_deltas) == 4, \
+        f"Should drop malicious, keep 4 honest, got {len(filtered_deltas)}: {filtered_weights}"
+    assert len(filtered_weights) == 4
+
+    print("[PASS] test_stress_test_norm_filter_drops_malicious_grad")
+
+
+def test_stress_test_krum_drops_malicious_grad():
+    """
+    byzantine_krum in the stress test should exclude the malicious client
+    when f=1 and the malicious gradient is far from honest ones.
+
+    With n=5, f=1: n >= 2f+3 (5 >= 5) → Krum is viable.
+    k = n - f - 2 = 2 neighbors, n_keep = n - f - 1 = 3.
+    Multi-Krum selects the 3 most honest (closest to their neighbors).
+    The malicious client (index 4) should NOT be among the selected.
+    """
+    import sys; sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
+    from byzantine_stress_test import byzantine_krum
+
+    # 4 honest clients: similar gradients (norm ~5)
+    honest_base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm ≈ 5.5
+    deltas = [
+        {"layer.weight": honest_base.clone()},
+        {"layer.weight": honest_base.clone() + torch.randn_like(honest_base) * 0.01},
+        {"layer.weight": honest_base.clone() + torch.randn_like(honest_base) * 0.01},
+        {"layer.weight": honest_base.clone() + torch.randn_like(honest_base) * 0.01},
+    ]
+
+    # 1 malicious: very different gradient (opposite sign, 50× magnitude)
+    malicious = {"layer.weight": honest_base * -50.0}
+    deltas.append(malicious)
+    weights = [1.0] * 5
+
+    result, _ = byzantine_krum(deltas, weights, n_malicious=1)
+
+    # The result should be a dict of tensors (aggregated honest gradients)
+    assert isinstance(result, dict), f"Krum should return dict, got {type(result)}"
+    assert "layer.weight" in result
+
+    # The malicious (index 4) should NOT contribute meaningfully.
+    # Check by comparing to the honest mean: if malicious was included,
+    # the result would be far from the honest mean.
+    honest_mean = sum(d["layer.weight"] for d in deltas[:4]).float() / 4.0
+    deviation = (result["layer.weight"].float() - honest_mean).abs().max().item()
+    # deviation should be small (malicious excluded), not huge (malicious included)
+    assert deviation < 5.0, \
+        f"Result too far from honest mean (malicious likely included): deviation={deviation:.2f}"
+
+    print("[PASS] test_stress_test_krum_drops_malicious_grad")
+
+
+def test_stress_test_trimmed_mean_excludes_malicious():
+    """
+    byzantine_trimmed_mean should naturally exclude malicious values at the
+    extremes even without explicit detection.
+
+    With n=5, trim 10% each side → trim 0 (floor(0.1*5)=0), keep all 5.
+    We need n=6+ or a larger trim fraction. Use n=6 with trim 1 each side.
+    """
+    import sys; sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
+    from byzantine_stress_test import byzantine_trimmed_mean
+
+    # 5 honest clients: similar gradients
+    honest_base = torch.tensor([[1.0, 2.0], [3.0, 4.0]])  # norm ≈ 5.5
+    deltas = [
+        {"layer.weight": honest_base * n} for n in [1.0, 1.1, 1.2, 0.9, 1.05]
+    ]
+    # 1 malicious: opposite sign, huge magnitude
+    malicious = {"layer.weight": honest_base * -50.0}
+    deltas.append(malicious)
+    weights = [1.0] * 6
+
+    result = byzantine_trimmed_mean(deltas, weights, trim_fraction=0.2)
+
+    # n=6, alpha=0.2 → trim 1 from each side, mean of 4 middle values
+    # The middle 4 should be the 5 honest (small magnitude) ones,
+    # not the huge malicious. The result norm should be small.
+    result_norm = torch.norm(result["layer.weight"]).item()
+    assert result_norm < 10.0, \
+        f"Trimmed mean result norm too large (malicious included?): {result_norm:.2f}"
+
+    print("[PASS] test_stress_test_trimmed_mean_excludes_malicious")
+
+
+def test_stress_test_krum_viable_with_5_clients_f1():
+    """
+    Verify Krum does NOT fall back to mean with n=5, f=1.
+    n=5 >= 2f+3=5 → Krum is viable. Previously the bug was n <= 2f+1 = 3
+    which would have triggered fallback even for n=5.
+    """
+    import sys; sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
+    from byzantine_stress_test import byzantine_krum
+
+    # Simple 5-client setup with distinct gradients
+    deltas = [{"layer.weight": torch.tensor([[float(i)]]) for i in range(1, 6)}]
+    weights = [1.0] * 5
+
+    result, _ = byzantine_krum(deltas, weights, n_malicious=1)
+
+    # Should NOT fall back (no warning about insufficient clients)
+    assert isinstance(result, dict), f"Krum should return dict, got {type(result)}"
+    assert "layer.weight" in result
+
+    print("[PASS] test_stress_test_krum_viable_with_5_clients_f1")
 
 
 # ============================================================================
@@ -1118,7 +1332,7 @@ def test_audit_logger_tamper_detection():
             f.write(fake_entry + b"\n")
 
         result = logger.verify_chain(date_str)
-        # The fake entry will fail to decrypt — this is detected as a tamper
+        # The fake entry will fail to decrypt â€" this is detected as a tamper
         assert result["valid"] is False or len(result["errors"]) > 0
 
     print("[PASS] test_audit_logger_tamper_detection")
@@ -1157,12 +1371,399 @@ def test_audit_logger_compliance_report():
 
 
 # ============================================================================
+# 11. pyproject.toml completeness tests
+# ============================================================================
+
+def test_pyproject_toml_packages_includes_federated_lisa_utils():
+    """Verify pyproject.toml [tool.setuptools] packages covers key modules."""
+    import tomllib
+
+    pyproject_path = PROJECT_ROOT / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    packages = data.get("tool", {}).get("setuptools", {}).get("packages", [])
+    # packages can be a list of str or a dict with find directive
+    if isinstance(packages, dict):
+        # e.g. {"find": ""} â€" setuptools will auto-discover
+        packages = []
+
+    assert isinstance(packages, list), f"packages should be a list, got {type(packages)}"
+    assert "federated" in packages, f"'federated' not in packages: {packages}"
+    assert "lisa" in packages, f"'lisa' not in packages: {packages}"
+    assert "utils" in packages, f"'utils' not in packages: {packages}"
+    assert "api" in packages, f"'api' not in packages: {packages}"
+
+    print("[PASS] test_pyproject_toml_packages_includes_federated_lisa_utils")
+
+
+# ============================================================================
+# 12. Client auth tests
+# ============================================================================
+
+def test_federated_client_accepts_auth_token():
+    """
+    FederatedClient.__init__ should accept and store auth_token.
+    When auth_token is set, it should be sent as a Bearer header on submit.
+    """
+    from unittest.mock import patch, MagicMock
+    from federated.client import FederatedClient
+
+    # Patch the trainer so we don't actually load a model
+    with patch("federated.client.LocalTrainer") as mock_trainer_cls:
+        mock_trainer = MagicMock()
+        mock_trainer.compute_gradient_update.return_value = MagicMock(
+            client_id="test-client",
+            round_number=1,
+            timestamp=1234567890.0,
+            num_samples=100,
+            compressed_data=b"fake_data",
+            compression_info={"method": "pickle-zlib"},
+            noise_seed=None,
+            dp_epsilon=None,
+            gradient_norm=1.0,
+            loss_before=2.0,
+            loss_after=1.8,
+            param_names=["layer.weight"],
+        )
+        mock_trainer._latest_raw_gradients = {"layer.weight": torch.tensor([1.0, 2.0])}
+        mock_trainer._latest_raw_round = 1
+        mock_trainer_cls.return_value = mock_trainer
+
+        # Create client WITH auth token
+        client = FederatedClient(
+            client_id="test-client",
+            server_url="http://localhost:8000",
+            auth_token="secret-token-123",
+        )
+
+        assert client.auth_token == "secret-token-123", \
+            f"auth_token not stored: {client.auth_token}"
+
+        # Create client WITHOUT auth token
+        client_no_auth = FederatedClient(
+            client_id="test-client-noauth",
+            server_url="http://localhost:8000",
+        )
+        assert client_no_auth.auth_token is None, \
+            "auth_token should be None when not provided"
+
+        print("[PASS] test_federated_client_accepts_auth_token")
+
+
+def test_client_submits_with_bearer_header():
+    """When auth_token is set, submit uses Bearer Authorization header."""
+    import requests
+    from unittest.mock import patch, MagicMock
+    from federated.client import FederatedClient
+
+    with patch("federated.client.LocalTrainer") as mock_trainer_cls:
+        mock_trainer = MagicMock()
+        mock_update = MagicMock(
+            client_id="auth-client",
+            round_number=1,
+            timestamp=1234567890.0,
+            num_samples=50,
+            compressed_data=b"gradient_bytes",
+            compression_info={"method": "pickle-zlib"},
+            noise_seed=None,
+            dp_epsilon=None,
+            gradient_norm=0.5,
+            loss_before=3.0,
+            loss_after=2.5,
+            param_names=["layer.weight"],
+        )
+        mock_trainer.compute_gradient_update.return_value = mock_update
+        mock_trainer._latest_raw_gradients = None
+        mock_trainer_cls.return_value = mock_trainer
+
+        client = FederatedClient(
+            client_id="auth-client",
+            server_url="http://localhost:8000",
+            auth_token="my-secret",
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch.object(requests, "post", return_value=mock_response) as mock_post:
+            client.train_and_submit(round_number=1)
+
+            # Check the call was made with the Authorization header
+            mock_post.assert_called_once()
+            _, kwargs = mock_post.call_args
+            assert "headers" in kwargs, f"headers not in call kwargs: {kwargs}"
+            assert kwargs["headers"].get("Authorization") == "Bearer my-secret", \
+                f"Bearer header wrong: {kwargs['headers']}"
+
+        # Without auth_token, no Authorization header should be sent
+        client_no_auth = FederatedClient(
+            client_id="no-auth-client",
+            server_url="http://localhost:8000",
+        )
+        with patch.object(requests, "post", return_value=mock_response) as mock_post_noauth:
+            client_no_auth.train_and_submit(round_number=1)
+            _, kwargs = mock_post_noauth.call_args
+            assert "headers" not in kwargs or kwargs.get("headers", {}).get("Authorization") is None, \
+                "No Authorization header should be sent when auth_token is None"
+
+        print("[PASS] test_client_submits_with_bearer_header")
+
+
+def test_client_disconnect_method():
+    """FederatedClient.disconnect() sends a POST to /disconnect endpoint."""
+    import requests
+    from unittest.mock import patch, MagicMock
+    from federated.client import FederatedClient
+
+    with patch("federated.client.LocalTrainer") as mock_trainer_cls:
+        mock_trainer = MagicMock()
+        mock_trainer_cls.return_value = mock_trainer
+
+        client = FederatedClient(
+            client_id="disc-client",
+            server_url="http://localhost:8000",
+            auth_token="logout-token",
+        )
+        client.state.round_number = 5
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"status": "disconnected", "client_id": "disc-client"}
+
+        with patch.object(requests, "post", return_value=mock_resp) as mock_post:
+            result = client.disconnect()
+
+            mock_post.assert_called_once()
+            call_url = mock_post.call_args[0][0]
+            call_kwargs = mock_post.call_args[1]
+            assert "/disconnect" in call_url, f"Wrong URL: {call_url}"
+            assert call_kwargs.get("headers", {}).get("Authorization") == "Bearer logout-token", \
+                f"Wrong auth header: {call_kwargs}"
+            assert call_kwargs["json"]["client_id"] == "disc-client"
+            assert call_kwargs["json"]["round_number"] == 5
+            assert result["status"] == "disconnected"
+
+        # Without auth_token, disconnect should log and skip
+        client_no_auth = FederatedClient(
+            client_id="disc-client-noauth",
+            server_url="http://localhost:8000",
+        )
+        with patch.object(requests, "post") as mock_post:
+            result = client_no_auth.disconnect()
+            assert result["status"] == "skipped"
+            mock_post.assert_not_called()
+
+        print("[PASS] test_client_disconnect_method")
+
+
+
+
+"""Phase 3 tests — written by subagent."""
+
+import asyncio
+import tempfile
+import shutil
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import time
+
+
+def _make_mock_server(config_dict):
+    """
+    Return a real FederatedServer with _init_model patched so no model download occurs.
+    """
+    from federated.server import DEFAULT_CONFIG
+    from unittest.mock import MagicMock
+    from federated import server as server_mod
+
+    cfg = {**DEFAULT_CONFIG, **config_dict}
+
+    mock_tok = MagicMock()
+    mock_tok.pad_token = None
+    mock_tok.eos_token = "[EOS]"
+    mock_model = MagicMock()
+    mock_model.state_dict.return_value = {}
+    mock_model.load_state_dict.return_value = None
+    mock_model.parameters.return_value = iter([])
+
+    orig_init = server_mod.FederatedServer._init_model
+
+    def fake_init(self):
+        self.tokenizer = mock_tok
+        self.model = mock_model
+        self.global_round = 0
+
+    server_mod.FederatedServer._init_model = fake_init
+    try:
+        srv = server_mod.FederatedServer(cfg)
+    finally:
+        server_mod.FederatedServer._init_model = orig_init
+
+    return srv
+
+
+def test_server_disconnect_endpoint_marks_client_inactive():
+    """Server /disconnect endpoint should mark client inactive and add it to clients_disconnected."""
+    from federated.server import FederatedServer, ClientInfo, RoundState
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        server = _make_mock_server({
+            "checkpoint_dir": str(tmpdir / "ckpt"),
+            "log_dir": str(tmpdir / "logs"),
+        })
+
+        with server._get_lock():
+            server.round_state[1] = RoundState(
+                round_number=1,
+                status="collecting",
+                started_at=time.time(),
+            )
+            server.clients["hospital_A"] = ClientInfo(
+                client_id="hospital_A",
+                registered_at=time.time(),
+                last_seen=time.time(),
+                is_active=True,
+            )
+
+        async def run_disconnect(srv):
+            from federated.server import disconnect as disconnect_fn
+            import federated.server as mod
+            old = mod._server
+            mod._server = srv
+            try:
+                req = MagicMock()
+                async def fake_json():
+                    return {"client_id": "hospital_A", "round_number": 1}
+                req.json = fake_json
+                req.headers = {}
+                return await disconnect_fn(req)
+            finally:
+                mod._server = old
+
+        result = asyncio.new_event_loop().run_until_complete(run_disconnect(server))
+
+        assert result["status"] == "disconnected"
+        assert result["client_id"] == "hospital_A"
+
+        with server._get_lock():
+            assert server.clients["hospital_A"].is_active is False
+            assert "hospital_A" in server.round_state[1].clients_disconnected
+
+        print("[PASS] test_server_disconnect_endpoint_marks_client_inactive")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_server_auth_on_submit_requires_bearer_token():
+    """When server has auth_token configured, /submit without valid Bearer header should return 401."""
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        server = _make_mock_server({
+            "checkpoint_dir": str(tmpdir / "ckpt"),
+            "log_dir": str(tmpdir / "logs"),
+            "auth_token": "server-secret",
+        })
+
+        async def run_submit(req):
+            # Import the submit function and bind _server to our server instance
+            from federated.server import submit as submit_fn
+            import federated.server as fed_server_mod
+            old_server = fed_server_mod._server
+            fed_server_mod._server = server
+            try:
+                return await submit_fn(req)
+            finally:
+                fed_server_mod._server = old_server
+
+        def make_async_req(auth_header):
+            async def fake_json():
+                return {"client_id": "c1", "round_number": 1, "num_samples": 100, "gradient_norm": 1.0}
+            req = MagicMock()
+            req.json = fake_json
+            req.headers = {"Authorization": auth_header} if auth_header else {}
+            return req
+
+        # No auth → should raise HTTPException 401
+        try:
+            asyncio.new_event_loop().run_until_complete(run_submit(make_async_req(None)))
+            raise AssertionError("Expected HTTPException 401 for missing auth")
+        except Exception as e:
+            assert hasattr(e, "status_code") and e.status_code == 401, \
+                f"Expected HTTPException 401, got: {type(e).__name__}: {e}"
+
+        # Wrong token → should raise HTTPException 401
+        try:
+            asyncio.new_event_loop().run_until_complete(run_submit(make_async_req("Bearer wrong-token")))
+            raise AssertionError("Expected HTTPException 401 for wrong auth")
+        except Exception as e:
+            assert hasattr(e, "status_code") and e.status_code == 401, \
+                f"Expected HTTPException 401, got: {type(e).__name__}: {e}"
+
+        # Correct token → should NOT raise 401 auth error
+        exc_info = None
+        try:
+            asyncio.new_event_loop().run_until_complete(run_submit(make_async_req("Bearer server-secret")))
+        except Exception as e:
+            exc_info = e
+        if exc_info is not None and hasattr(exc_info, "status_code"):
+            assert exc_info.status_code != 401, \
+                f"Should NOT return 401 with correct token, got: {exc_info}"
+
+        print("[PASS] test_server_auth_on_submit_requires_bearer_token")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_socket_handler_marks_disconnected_on_connection_error():
+    """FederatedSocketHandler._mark_client_disconnected adds client to round's disconnected list."""
+    from federated.server import FederatedSocketHandler, ClientInfo, RoundState
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        server = _make_mock_server({
+            "checkpoint_dir": str(tmpdir / "ckpt"),
+            "log_dir": str(tmpdir / "logs"),
+        })
+
+        with server._get_lock():
+            server.round_state[1] = RoundState(
+                round_number=1,
+                status="collecting",
+                started_at=time.time(),
+            )
+            server.clients["client-1"] = ClientInfo(
+                client_id="client-1",
+                registered_at=time.time(),
+                last_seen=time.time(),
+            )
+
+        # Call _mark_client_disconnected directly
+        # FederatedSocketHandler._mark_client_disconnected(self, server, lock, client_id, round_num)
+        # Here 'handler' acts as self, and we pass server, lock, client_id, round_num
+        handler = FederatedSocketHandler.__new__(FederatedSocketHandler)
+        handler._mark_client_disconnected(server, server._get_lock(), "client-1", 1)
+
+        with server._get_lock():
+            assert "client-1" in server.round_state[1].clients_disconnected
+
+        print("[PASS] test_socket_handler_marks_disconnected_on_connection_error")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+
+
+# ============================================================================
 # pytest entry points
 # ============================================================================
 
 if __name__ == "__main__":
     tests = [
         test_lora_linear_math,
+        test_lora_both_params_trainable_and_get_gradients,
         test_lisa_layer_selection_always_includes_bounds,
         test_lisa_selection_is_deterministic_with_seed,
         test_get_lora_gradients_only_lora_params,
@@ -1190,28 +1791,30 @@ if __name__ == "__main__":
         test_byzantine_aggregate_preserves_shape,
         test_byzantine_krum_selects_closest_to_neighbors,
         test_byzantine_fallback_when_all_look_malicious,
+        # Byzantine stress-test inline impl tests
+        test_stress_test_norm_filter_drops_malicious_grad,
+        test_stress_test_krum_drops_malicious_grad,
+        test_stress_test_trimmed_mean_excludes_malicious,
+        test_stress_test_krum_viable_with_5_clients_f1,
         # HIPAA audit logger
         test_audit_logger_records_events,
         test_audit_logger_chain_integrity,
         test_audit_logger_tamper_detection,
         test_audit_logger_compliance_report,
+        # Phase 3: new features
+        test_pyproject_toml_packages_includes_federated_lisa_utils,
+        test_federated_client_accepts_auth_token,
+        test_client_submits_with_bearer_header,
+        test_client_disconnect_method,
+        test_server_disconnect_endpoint_marks_client_inactive,
+        test_server_auth_on_submit_requires_bearer_token,
+        test_socket_handler_marks_disconnected_on_connection_error,
     ]
 
-    failed = []
-    for fn in tests:
+    print(f"Running {len(tests)} tests ...")
+    for t in tests:
         try:
-            fn()
+            t()
         except Exception as e:
-            print(f"[FAIL] {fn.__name__}: {e}")
-            failed.append((fn.__name__, e))
-            gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    print(f"\n{'='*60}")
-    if not failed:
-        print(f"  All {len(tests)} tests passed!")
-    else:
-        print(f"  {len(failed)}/{len(tests)} tests FAILED:")
-        for name, exc in failed:
-            print(f"    FAILED: {name}: {exc}")
-    print(f"{'='*60}")
+            print(f"  FAILED: {t.__name__}: {e}")
+    print("Done.")

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Byzantine Resilience Stress Test — Suite 3
+Byzantine Resilience Stress Test - Suite 3
 
 Attacks plain FedAvg (no defense) with 1 malicious client sending
 adversarial gradients (random noise scaled 10× true gradient norm).
@@ -559,6 +559,7 @@ def aggregate_deltas(
     wrapper: LoraAppliedModel,
     byzantine_method: str = "none",
     n_malicious: int = 0,
+    round_num: int = 0,
 ) -> None:
     """Apply weighted gradient deltas using specified Byzantine defense."""
     if not deltas or not weights:
@@ -602,15 +603,22 @@ def aggregate_deltas(
     else:
         raise ValueError(f"Unknown Byzantine method: {byzantine_method}")
 
-    # Apply accumulated delta to server model — scale by SERVER_LR so the
+    # Apply accumulated delta to server model - scale by SERVER_LR so the
     # aggregated multi-step gradient doesn't catastrophically diverge the model.
     SERVER_LR = 0.1
+    # DEBUG: log aggregation magnitude
+    _dbg_norms = [v.float().norm().item() for v in acc.values()]
+    logger.info(f"  [AGG] acc norm avg={sum(_dbg_norms)/len(_dbg_norms):.6f} max={max(_dbg_norms):.6f} SERVER_LR={SERVER_LR}")
     for full_name, lora_layer in wrapper.lora_layers.items():
         for suffix in ["lora_A", "lora_B"]:
             key = f"{full_name}.{suffix}"
             if key in acc:
                 with torch.no_grad():
+                    _before_norm = getattr(lora_layer, suffix).data.norm().item()
                     getattr(lora_layer, suffix).add_(acc[key] * SERVER_LR)
+                    _after_norm = getattr(lora_layer, suffix).data.norm().item()
+                    if round_num == 1 and full_name == list(wrapper.lora_layers.keys())[0]:
+                        logger.info(f"  [AGG]   {suffix} {full_name[:40]}: {_before_norm:.6f} -> {_after_norm:.6f} (delta={_after_norm-_before_norm:+.6f})")
 
 
 # ---------------------------------------------------------------------------
@@ -631,7 +639,7 @@ def run_byzantine_experiment(
     dist_label = "IID (random)"
 
     logger.info("=" * 70)
-    logger.info(f"BYZANTINE STRESS TEST — {label}")
+    logger.info(f"BYZANTINE STRESS TEST - {label}")
     logger.info(f"  Byzantine method: {byzantine_method}")
     logger.info(f"  Malicious clients: {n_malicious}")
     logger.info(f"  Attack type: {attack_label}")
@@ -730,6 +738,7 @@ def run_byzantine_experiment(
             deltas, weights, wrapper,
             byzantine_method=byzantine_method,
             n_malicious=n_malicious,
+            round_num=r,
         )
 
         # Evaluate perplexity

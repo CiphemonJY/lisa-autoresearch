@@ -1757,6 +1757,86 @@ def test_socket_handler_marks_disconnected_on_connection_error():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ============================================================================
+# 11. GradientUpdate dataclass tests
+# ============================================================================
+
+def test_gradient_update_to_dict_roundtrip():
+    """
+    GradientUpdate is created by FederatedClient.compute_gradient_update().
+    Verify its to_dict() produces a correctly-shaped dict and that
+    compression_info + dp_epsilon are preserved through serialization.
+    """
+    from federated.client import GradientUpdate
+    import pickle
+
+    update = GradientUpdate(
+        client_id="c1",
+        round_number=5,
+        timestamp=1700000000.0,
+        num_samples=150,
+        param_names=["lora_A", "lora_B"],
+        compressed_data=b"\x00\x01\x02\x03",
+        compression_info={"method": "both", "k": 0.1, "bits": 8, "compression_ratio": 42.0},
+        noise_seed=42,
+        dp_epsilon=2.5,
+        gradient_norm=1.23,
+        loss_before=2.71,
+        loss_after=2.13,
+    )
+
+    d = update.to_dict()
+
+    # Check all expected keys are present
+    assert d["client_id"] == "c1"
+    assert d["round_number"] == 5
+    assert d["timestamp"] == 1700000000.0
+    assert d["num_samples"] == 150
+    assert d["num_params"] == 2
+    assert d["gradient_norm"] == 1.23
+    assert d["loss_before"] == 2.71
+    assert d["loss_after"] == 2.13
+    assert d["compression_info"] == {"method": "both", "k": 0.1, "bits": 8, "compression_ratio": 42.0}
+    assert d["dp_epsilon"] == 2.5
+
+    # Verify the update survives pickle roundtrip (used internally by some transports)
+    pickled = pickle.dumps(update)
+    restored = pickle.loads(pickled)
+    assert restored.client_id == "c1"
+    assert restored.compression_info["method"] == "both"
+    assert restored.dp_epsilon == 2.5
+
+    print("[PASS] test_gradient_update_to_dict_roundtrip")
+
+
+# ============================================================================
+# 12. Compression: method="none" roundtrip
+# ============================================================================
+
+def test_compress_gradients_method_none_roundtrip():
+    """
+    Test compress_gradients with method='none'.
+    Verifies the raw pickle path: gradients should survive
+    compress/decompress unchanged when no compression is applied.
+    """
+    from federated.compression import compress_gradients, decompress_gradients
+
+    grad_dict = {
+        "lora_A": torch.randn(4, 16),
+        "lora_B": torch.randn(8, 4),
+        "layer.weight": torch.randn(8, 16),
+    }
+
+    compressed, metadata = compress_gradients(grad_dict, method="none")
+    restored = decompress_gradients(compressed, metadata)
+
+    assert set(restored.keys()) == set(grad_dict.keys())
+    for name in grad_dict:
+        assert torch.allclose(restored[name].float(), grad_dict[name].float(), atol=1e-4), \
+            f"method='none' roundtrip changed tensor '{name}'"
+    assert metadata["method"] == "none"
+
+    print("[PASS] test_compress_gradients_method_none_roundtrip")
 
 
 # ============================================================================

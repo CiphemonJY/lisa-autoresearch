@@ -229,6 +229,7 @@ def cmd_mlx(args):
         from mlx_lm.lora import linear_to_lora_layers, train_model, TrainingArgs, load_dataset
         from dataclasses import dataclass, field
         import mlx.core as mx
+        import mlx.nn as nn
         import mlx.optimizers as optim
     except ImportError as e:
         print(f"  ERROR: MLX not available: {e}")
@@ -304,7 +305,15 @@ def cmd_mlx(args):
         optimizer = optim.Adam(learning_rate=1e-4)
         losses = []
         def loss_fn(model, batch):
-            return mx.mean(model(batch)[:, :-1] != mx.argmax(model(batch)[:, 1:], axis=-1)).astype(mx.float32)
+            # Create simple labels: next token prediction
+            labels = mx.concatenate([batch[:, 1:], mx.zeros((batch.shape[0], 1), dtype=batch.dtype)], axis=1)
+            logits = model(batch)
+            # Flatten for cross-entropy
+            loss = mx.mean(mx.nn.losses.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                labels[:, 1:].reshape(-1)
+            ))
+            return loss
 
         for step in range(iters):
             batch = mx.random.randint(0, 1000, (args.batch_size, 64))

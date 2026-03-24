@@ -224,12 +224,14 @@ def compute_perplexity(model, test_enc, batch_size=BATCH_SIZE):
         end = min((i + 1) * batch_size, len(test_enc["input_ids"]))
         ids = test_enc["input_ids"][start:end].clone().clamp(0, model.config.vocab_size - 1)
         mask = test_enc["attention_mask"][start:end]
-        labs = test_enc["labels"][start:end].clone().clamp(0, model.config.vocab_size - 1)
+        labs = test_enc["labels"][start:end].clone()
+        # Replace padding tokens in labels with -100 so they don't pollute loss
+        labs = labs.where(labs != pad_token_id, torch.tensor(-100, device=labs.device))
         outputs = model(input_ids=ids, attention_mask=mask)
-        loss_fn = nn.CrossEntropyLoss(ignore_index=pad_token_id)
+        loss_fn = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
         loss = loss_fn(outputs.logits.view(-1, outputs.logits.size(-1)), labs.view(-1))
-        total_loss += loss.item() * ids.numel()
-        total_tokens += ids.numel()
+        total_loss += loss.item() * mask.sum().item()
+        total_tokens += mask.sum().item()
     model.train()
     return math.exp(total_loss / max(total_tokens, 1)) if total_tokens > 0 else float("inf")
 

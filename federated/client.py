@@ -63,17 +63,22 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.dropout_p = dropout
         self.target_module_name = target_module_name
-        self.is_conv1d = isinstance(linear, (nn.Conv1d, nn.modules.conv.Conv1d))
+        self.is_conv1d = isinstance(linear, (nn.Conv1d, nn.modules.conv.Conv1d)) or type(linear).__name__ == 'Conv1D'
 
         if self.is_conv1d:
-            self.in_features = linear.in_channels
-            self.out_features = linear.out_channels
+            # Conv1D: weight (nf, nx) where input=nx, output=nf
+            # Use LoRA_AFTER: A=(rank,nf), B=(nf,rank) applied to layer output
+            self.in_features = linear.nx  # Conv1D input dim (for LoRA dropout)
+            self.out_features = linear.nf  # Conv1D output dim
+            self.lora_A = nn.Parameter(torch.randn(rank, self.out_features) * 0.01)
+            self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
         else:
+            # Linear: weight (out, in), LoRA_BEFORE: A=(rank,in), B=(out,rank)
             self.in_features = linear.in_features
             self.out_features = linear.out_features
+            self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
+            self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
 
-        self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
         self.scaling = alpha / rank
 
@@ -81,15 +86,19 @@ class LoRALinear(nn.Module):
             param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        original = self.linear(x)
-        lora_input = self.lora_dropout(x)
         if self.is_conv1d:
-            lora = nn.functional.linear(lora_input, self.lora_A)
-            lora = nn.functional.linear(lora, self.lora_B)
+            # LoRA_AFTER: apply LoRA to the OUTPUT of Conv1D
+            original = self.linear(x)
+            # lora: (..., nf) @ (nf, rank) @ (rank, nf) = (..., nf)
+            lora = original @ self.lora_A.T @ self.lora_B.T
+            return original + lora * self.scaling
         else:
-            lora = nn.functional.linear(lora_input, self.lora_A)
-            lora = nn.functional.linear(lora, self.lora_B)
-        return original + lora * self.scaling
+            # LoRA_BEFORE: apply LoRA to the INPUT of Linear
+            lora_input = self.lora_dropout(x)
+            # lora: (..., in) @ (in, rank) @ (rank, out) = (..., out)
+            lora = lora_input @ self.lora_A.T @ self.lora_B.T
+            original = self.linear(x)
+            return original + lora * self.scaling
 
 
 def apply_lora_to_model(model: nn.Module, rank: int = 4, alpha: float = 8.0,
@@ -110,7 +119,8 @@ def apply_lora_to_model(model: nn.Module, rank: int = 4, alpha: float = 8.0,
     ]
     count = 0
     for full_name, module in model.named_modules():
-        if not isinstance(module, (nn.Linear, nn.Conv1d)):
+        is_linear_or_conv1d = isinstance(module, (nn.Linear, nn.Conv1d)) or type(module).__name__ == 'Conv1D'
+        if not is_linear_or_conv1d:
             continue
         if not any(tm in full_name for tm in target_names):
             continue

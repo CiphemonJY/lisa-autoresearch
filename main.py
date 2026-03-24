@@ -229,6 +229,7 @@ def cmd_mlx(args):
         from mlx_lm.lora import linear_to_lora_layers, train_model, TrainingArgs, load_dataset
         from dataclasses import dataclass, field
         import mlx.core as mx
+        import mlx.optimizers as optim
     except ImportError as e:
         print(f"  ERROR: MLX not available: {e}")
         print(f"  Install with: pip install mlx mlx-lm")
@@ -300,7 +301,7 @@ def cmd_mlx(args):
         return {"status": "success", "final_loss": final_loss, "time": elapsed}
     else:
         # Fallback: basic training loop
-        optimizer = mx.optim.Adam(learning_rate=1e-4)
+        optimizer = optim.Adam(learning_rate=1e-4)
         losses = []
         for step in range(iters):
             batch = mx.random.randint(0, 1000, (args.batch_size, 64))

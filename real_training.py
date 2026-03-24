@@ -3,7 +3,7 @@
 Real training run on Windows/Intel PC.
 Uses pythia-70m (14M params, proper nn.Linear) with LoRA on real eli5 dataset.
 """
-import os, sys, time, torch, logging
+import os, sys, time, torch, logging, argparse
 from pathlib import Path
 
 # Setup
@@ -31,7 +31,15 @@ else:
 print(f"[macOS] Using device: {DEVICE}")
 
 # ─── Model ───────────────────────────────────────────────────────────────────
-MODEL_ID = "EleutherAI/pythia-160m"   # 14M params, nn.Linear, LoRA-friendly
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", default="EleutherAI/pythia-160m")
+parser.add_argument("--steps", type=int, default=200)
+parser.add_argument("--lora-rank", type=int, default=4)
+parser.add_argument("--batch-size", type=int, default=4)
+parser.add_argument("--lr", type=float, default=3e-4)
+args = parser.parse_args()
+
+MODEL_ID = args.model   # Now respects --model flag!
 
 # ─── Dataset ────────────────────────────────────────────────────────────────
 # Using wikitext for language modeling (no tokenization headaches)
@@ -41,18 +49,18 @@ MAX_SEQ_LEN = 128
 TRAIN_SIZE = 2000                    # 2000 samples for real training
 
 # ─── LoRA / LISA ────────────────────────────────────────────────────────────
-LORA_RANK = 4
+LORA_RANK = args.lora_rank
 LORA_ALPHA = 8
 LORA_DROPOUT = 0.05
 LORA_TARGET_MODULES = ["attn", "fc", "proj"]  # Works for Pythia
 
-# ─── Training ───────────────────────────────────────────────────────────────
-BATCH_SIZE = 4
+# ─── Training ────────────────────────────────────────────────────────────────
+BATCH_SIZE = args.batch_size
 GRAD_ACCUM = 4                      # Effective batch = 16
-LEARNING_RATE = 3e-4
+LEARNING_RATE = args.lr
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 20
-TRAIN_STEPS = 200                   # Real training: 200 steps
+TRAIN_STEPS = args.steps           # Now respects --steps flag!
 SAVE_EVERY = 50
 OUTPUT_DIR = ROOT / "output" / "real_training"
 

@@ -21,12 +21,19 @@ import zlib
 import pickle
 import random
 import logging
+import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
+
+# LoRA implementation
+import torch
+import torch.nn as nn
+from dataclasses import dataclass as _dc, field as _field
+from typing import List as _List
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +42,82 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("fed-client")
+
+
+# ============================================================================
+# LoRA Implementation
+# ============================================================================
+
+class LoRALinear(nn.Module):
+    """LoRA for linear layers (nn.Linear and nn.Conv1d/GPT2Conv1D)."""
+
+    def __init__(self, linear: nn.Module, rank: int = 4, alpha: float = 8.0,
+                 dropout: float = 0.05, target_module_name: str = ""):
+        super().__init__()
+        self.linear = linear
+        self.rank = rank
+        self.alpha = alpha
+        self.dropout_p = dropout
+        self.target_module_name = target_module_name
+        self.is_conv1d = isinstance(linear, (nn.Conv1D, nn.modules.conv.Conv1d))
+
+        if self.is_conv1d:
+            self.in_features = linear.in_channels
+            self.out_features = linear.out_channels
+        else:
+            self.in_features = linear.in_features
+            self.out_features = linear.out_features
+
+        self.lora_A = nn.Parameter(torch.randn(rank, self.in_features) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
+        self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.scaling = alpha / rank
+
+        for param in self.linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original = self.linear(x)
+        lora_input = self.lora_dropout(x)
+        if self.is_conv1d:
+            lora = nn.functional.linear(lora_input, self.lora_A)
+            lora = nn.functional.linear(lora, self.lora_B)
+        else:
+            lora = nn.functional.linear(lora_input, self.lora_A)
+            lora = nn.functional.linear(lora, self.lora_B)
+        return original + lora * self.scaling
+
+
+def apply_lora_to_model(model: nn.Module, rank: int = 4, alpha: float = 8.0,
+                        dropout: float = 0.05) -> int:
+    """
+    Apply LoRA to all Linear/Conv1D layers in a model.
+    Returns number of layers modified.
+    """
+    target_names = ["c_attn", "c_proj", "c_fc", "query_key_value", "dense", "mlp",
+                    "q_proj", "k_proj", "v_proj", "o_proj"]
+    count = 0
+    for full_name, module in model.named_modules():
+        if not isinstance(module, (nn.Linear, nn.Conv1d)):
+            continue
+        if not any(tm in full_name for tm in target_names):
+            continue
+        lora = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout,
+                          target_module_name=full_name)
+        parts = full_name.rsplit(".", 1)
+        if len(parts) == 2:
+            try:
+                parent = model.get_submodule(parts[0])
+                setattr(parent, parts[1], lora)
+                count += 1
+            except (KeyError, AttributeError):
+                pass
+    return count
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
 
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -392,53 +475,43 @@ class LocalTrainer:
                 
                 # Load model
                 config = AutoConfig.from_pretrained(name, trust_remote_code=True)
-                
+
                 self.model = AutoModelForCausalLM.from_pretrained(
                     name,
                     config=config,
                     trust_remote_code=True,
                     torch_dtype=torch.float32,
                 )
-                
-                # Freeze most layers for CPU efficiency (LISA-style)
-                self._freeze_except_last_n_layers(2)
-                
-                logger.info(f"Model loaded: {sum(p.numel() for p in self.model.parameters()):,} params")
+
+                # Apply LoRA: only train adapter params (A and B matrices)
+                lora_rank = self.config.get("lora_rank", 4)
+                lora_alpha = self.config.get("lora_alpha", 8.0)
+                lora_count = apply_lora_to_model(
+                    self.model,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=self.config.get("lora_dropout", 0.05),
+                )
+                logger.info(f"LoRA applied to {lora_count} layers (rank={lora_rank})")
+
+                # Freeze everything except LoRA params
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                for name, param in self.model.named_parameters():
+                    if "lora_" in name:
+                        param.requires_grad = True
+
+                trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                total = sum(p.numel() for p in self.model.parameters())
+                logger.info(f"Model loaded: {total:,} total params, {trainable:,} trainable ({trainable/max(total,1)*100:.1f}%)")
                 return
-                
+
             except Exception as e:
                 logger.warning(f"Failed to load {name}: {e}")
                 continue
-        
+
         raise RuntimeError("Could not load any model")
-    
-    def _freeze_except_last_n_layers(self, n: int):
-        """Freeze all but the last n transformer layers (LISA-style)."""
-        import re
-        total_layers = getattr(self.model, 'config', None)
-        if total_layers is not None:
-            total_layers = getattr(total_layers, 'n_layer', 6) or getattr(total_layers, 'num_hidden_layers', 6)
-        else:
-            total_layers = 6
-        
-        frozen = 0
-        for name, param in self.model.named_parameters():
-            layer_match = re.search(r'\.h\.(\d+)\.', name)
-            if layer_match:
-                layer_idx = int(layer_match.group(1))
-                # Freeze if NOT in last n layers
-                if layer_idx < total_layers - n:
-                    param.requires_grad = False
-                    frozen += 1
-            elif "lm_head" not in name and "embed" not in name:
-                # Freeze embedding and other non-layer params
-                param.requires_grad = False
-                frozen += 1
-        
-        # Count trainable
-        trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
-        logger.info(f"Trainable params: {trainable:,} (frozen {frozen})")
-    
+
     def _generate_local_data(self, num_samples: int = 200) -> List[Dict]:
         """
         Generate simulated local text data.

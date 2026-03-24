@@ -268,14 +268,13 @@ def cmd_mlx(args):
 
     # Build mlx_lm lora command
     cmd = [
-        sys.executable, "-m", "mlx_lm.lora",
+        sys.executable, "-m", "mlx_lm", "lora",
         "--model", args.model,
-        "--train-data", f"{data_path}:jsonl",
+        "--train",
+        "--data", tmpdir,
         "--batch-size", str(args.batch_size),
         "--iters", str(iters),
-        "--rank", str(lora_rank),
         "--steps-per-report", "10",
-        "--max-seq-length", str(args.max_seq),
     ]
 
     print(f"  Running: python -m mlx_lm.lora --model {args.model} --iters {iters}...")

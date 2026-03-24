@@ -303,12 +303,14 @@ def cmd_mlx(args):
         # Fallback: basic training loop
         optimizer = optim.Adam(learning_rate=1e-4)
         losses = []
+        def loss_fn(model, batch):
+            return mx.mean(model(batch)[:, :-1] != mx.argmax(model(batch)[:, 1:], axis=-1)).astype(mx.float32)
+
         for step in range(iters):
             batch = mx.random.randint(0, 1000, (args.batch_size, 64))
-            logits = model(batch)
-            loss = mx.mean((logits - mx.zeros_like(logits)) ** 2)
-            gradients = mx.grad(lambda x: mx.mean((model(x) - mx.zeros_like(model(x))) ** 2))(batch)
-            optimizer.step(model)
+            loss_and_grads = mx.value_and_grad(loss_fn)(model, batch)
+            loss, grads = loss_and_grads
+            optimizer.update(model, grads)
             losses.append(float(loss))
             if (step + 1) % 10 == 0:
                 print(f"  Step {step+1}/{iters}: loss={sum(losses[-10:])/10:.4f}")

@@ -70,9 +70,11 @@ class LISAConfig:
     lora_target_modules: List[str] = field(
         default_factory=lambda: [
             # GPT-2 / GPT-NeoX compatible
-            "c_attn", "c_proj", "c_fc", "c_proj",
+            "c_attn", "c_proj", "c_fc",
             # GPT-NeoX (Pythia, OLMo, etc.)
             "query_key_value", "dense", "mlp",
+            # Qwen/Llama architecture
+            "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
         ]
     )
 
@@ -477,19 +479,32 @@ def train(
     selected = trainer.select_layers(seed=42)
     logger.info(f"Training layers: {selected}")
 
-    # If LoRA applied to 0 layers (e.g. model uses Conv1D not Linear), freeze all,
-    # then manually unfreeze the selected layers for direct training
+    # If LoRA applied to 0 layers (e.g. model architecture not supported),
+    # freeze all EXCEPT the selected layers (architecture-agnostic approach)
     if lora_count == 0:
-        logger.info("LoRA not applied - freezing all params, will unfreeze selected layers")
+        logger.info("LoRA not applied - freezing all params, unfreezing selected layers by index")
         for p in trainer.model.parameters():
             p.requires_grad = False
 
-        # Unfreeze selected layers
+        # Unfreeze selected layers by walking model and matching layer indices
+        # Works for transformer.h (GPT), model.layers (Qwen/Llama), etc.
         for idx in selected:
-            layer_name = f"transformer.h.{idx}."
-            for name, param in trainer.model.named_parameters():
-                if layer_name in name:
+            unfrozen = False
+            for name, module in trainer.model.named_modules():
+                # Match layer containers by index in name
+                if f".{idx}." in name or name.endswith(f".{idx}"):
+                    for pname, param in module.named_parameters(recurse=False):
+                        if not param.is_floating_point():
+                            continue
+                        param.requires_grad = True
+                        unfrozen = True
+            # Also unfreeze by parameter name patterns
+            for pname, param in trainer.model.named_parameters():
+                if f".{idx}." in pname or pname.endswith(f".{idx}"):
                     param.requires_grad = True
+                    unfrozen = True
+            if unfrozen:
+                logger.info(f"  Unfroze layer {idx}")
 
         trainable_count = sum(1 for p in trainer.model.parameters() if p.requires_grad)
         logger.info(f"Direct training: {trainable_count} params unfrozen")

@@ -596,7 +596,7 @@ def demo_offload():
     )
     
     # Save results
-    output_file = Path.home() / ".lisa" / "packages" / "lisa-autoresearch" / "disk_offload_demo_results.json"
+    output_file = Path.home() / ".lisa" / "packages" / "LISA_FTM" / "disk_offload_demo_results.json"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_file, 'w') as f:

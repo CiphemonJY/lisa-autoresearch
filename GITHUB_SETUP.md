@@ -4,7 +4,7 @@
 
 1. **Create repository on GitHub**
    - Go to https://github.com/new
-   - Name: `lisa-autoresearch`
+   - Name: `LISA_FTM`
    - Description: "Train large language models on limited hardware using disk offloading"
    - License: MIT
    - Add README: Yes
@@ -13,11 +13,11 @@
 2. **Clone and push**
    ```bash
    # Clone your new repository
-   git clone https://github.com/CiphemonJY/lisa-autoresearch.git
-   cd lisa-autoresearch
+   git clone https://github.com/CiphemonJY/LISA_FTM.git
+   cd LISA_FTM
    
    # Copy all files from the package
-   cp -r /path/to/lisa-autoresearch/* .
+   cp -r /path/to/LISA_FTM/* .
    
    # Add all files
    git add .
@@ -130,3 +130,4 @@ For questions:
 - Check existing issues before opening new ones
 
 Good luck with your repository! 🚀
+ repository! 🚀

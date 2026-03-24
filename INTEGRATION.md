@@ -40,7 +40,7 @@ The script automatically chooses the best approach based on hardware:
 
 ### 1. Hardware Detection
 ```bash
-python3 packages/lisa-autoresearch/hardware_detection.py
+python3 packages/LISA_FTM/hardware_detection.py
 ```
 Detects: CPU, RAM, GPU, disk space → recommends optimal model
 

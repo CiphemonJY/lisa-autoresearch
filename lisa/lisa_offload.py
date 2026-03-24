@@ -672,7 +672,7 @@ if __name__ == "__main__":
     )
 
     # Save results
-    output_file = Path.home() / ".lisa" / "packages" / "lisa-autoresearch" / "lisa_offload_results.json"
+    output_file = Path.home() / ".lisa" / "packages" / "LISA_FTM" / "lisa_offload_results.json"
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_file, 'w') as f:

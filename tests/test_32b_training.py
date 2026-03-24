@@ -101,7 +101,7 @@ def test_offloaded_32b():
     print()
     
     # Import disk_offload module
-    sys.path.insert(0, str(Path.home() / ".lisa" / "packages" / "lisa-autoresearch"))
+    sys.path.insert(0, str(Path.home() / ".lisa" / "packages" / "LISA_FTM"))
     
     try:
         from lisa.offload import DiskOffloadedTrainer
@@ -322,7 +322,7 @@ def run_comprehensive_test():
             print(f"  Slowdown: ~100x vs 14B")
     
     # Save results
-    output_file = Path.home() / ".lisa" / "packages" / "lisa-autoresearch" / "32b_training_test_results.json"
+    output_file = Path.home() / ".lisa" / "packages" / "LISA_FTM" / "32b_training_test_results.json"
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
     with open(output_file, 'w') as f:

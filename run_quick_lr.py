@@ -2,7 +2,7 @@
 """Wrapper to run quick_lr_test.py with unbuffered output."""
 import sys, os, subprocess
 
-root = r"C:\Users\james\.openclaw\workspace\lisa-autoresearch"
+root = r"C:\Users\james\.openclaw\workspace\LISA_FTM"
 log_out = os.path.join(root, "quick_lr_test3.log")
 log_err = os.path.join(root, "quick_lr_test3.err")
 

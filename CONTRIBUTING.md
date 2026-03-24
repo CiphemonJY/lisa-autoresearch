@@ -38,8 +38,8 @@ Thank you for your interest in contributing! This project aims to democratize AI
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/lisa-autoresearch.git
-cd lisa-autoresearch
+git clone https://github.com/CiphemonJY/LISA_FTM.git
+cd LISA_FTM
 
 # Create virtual environment
 python3 -m venv venv
@@ -123,8 +123,8 @@ Contributors will be recognized in:
 ## Project Structure
 
 ```
-lisa-autoresearch/
-├── lisa_autoresearch/          # Main package
+LISA_FTM/
+├── LISA_FTM/              # Main package
 │   ├── __init__.py
 │   ├── disk_offload.py          # Disk-offload training
 │   └── train.py                 # Training entry point
@@ -144,7 +144,7 @@ lisa-autoresearch/
 ## Need Help?
 
 - Check [README.md](README.md) for usage
-- Open an [Issue](https://github.com/YOUR_USERNAME/lisa-autoresearch/issues) for bugs
-- Start a [Discussion](https://github.com/YOUR_USERNAME/lisa-autoresearch/discussions) for questions
+- Open an [Issue](https://github.com/CiphemonJY/LISA_FTM/issues) for bugs
+- Start a [Discussion](https://github.com/CiphemonJY/LISA_FTM/discussions) for questions
 
-Thank you for helping democratize AI training! 🎉
+Thank you for helping democratize AI training! 🎉���

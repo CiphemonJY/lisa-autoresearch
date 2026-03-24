@@ -18,7 +18,7 @@ import argparse
 from pathlib import Path
 
 # Add LISA package to path
-_LISA_PATH = Path(__file__).parent.parent / "packages" / "lisa-autoresearch"
+_LISA_PATH = Path(__file__).parent.parent / "packages" / "LISA_FTM"
 sys.path.insert(0, str(_LISA_PATH))
 
 os.environ['PYTHONWARNINGS'] = 'ignore::urllib3.warnings.NotOpenSSLWarning'

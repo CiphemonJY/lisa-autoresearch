@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 # Add LISA package to path for imports
-_LISA_PATH = Path(__file__).parent.parent / "packages" / "lisa-autoresearch"
+_LISA_PATH = Path(__file__).parent.parent / "packages" / "LISA_FTM"
 sys.path.insert(0, str(_LISA_PATH))
 
 # Available models

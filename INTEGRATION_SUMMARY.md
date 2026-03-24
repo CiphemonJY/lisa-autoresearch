@@ -57,7 +57,7 @@ MODEL_SIZE=32B ./scripts/weekly_retrain.sh
 ./scripts/train_32b.sh
 ```
 
-### 4. Python Training (`packages/lisa-autoresearch/train_32b_lisa.py`)
+### 4. Python Training (`packages/LISA_FTM/train_32b_lisa.py`)
 
 **Added:**
 - Python script for 32B training

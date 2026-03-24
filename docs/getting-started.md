@@ -19,7 +19,7 @@ pip install torch transformers datasets huggingface_hub numpy cryptography reque
 ### Step 2 — Start the server (Terminal 1)
 
 ```bash
-cd lisa-autoresearch
+cd LISA_FTM
 python -m federated.server --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --rounds 3 --port 8080
 ```
 
@@ -31,7 +31,7 @@ The server will:
 ### Step 3 — Run a client (Terminal 2)
 
 ```bash
-cd lisa-autoresearch
+cd LISA_FTM
 python fed_client.py --host 127.0.0.1 --port 8080
 ```
 
@@ -52,8 +52,8 @@ pip install torch transformers datasets huggingface_hub
 ### From source
 
 ```bash
-git clone https://github.com/CiphemonJY/lisa-autoresearch
-cd lisa-autoresearch
+git clone https://github.com/CiphemonJY/LISA_FTM
+cd LISA_FTM
 pip install -e .
 ```
 

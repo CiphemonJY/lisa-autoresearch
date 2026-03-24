@@ -23,7 +23,7 @@
 ## Proposed Structure
 
 ```
-lisa-autoresearch/
+LISA_FTM/
 ├── README.md                          ✅ Exists
 ├── requirements.txt                   ✅ Exists
 ├── setup.py                           ❌ MISSING
@@ -165,7 +165,7 @@ python main.py --mode inference --model quantized.pt --prompt "Hello"
 
 1. **Easy to use**: `from lisa import LISATrainer`
 2. **Clear organization**: Each module has a purpose
-3. **Pip installable**: `pip install lisa-autoresearch`
+3. **Pip installable**: `pip install LISA_FTM`
 4. **CLI entry point**: `python main.py --mode train`
 5. **Better testing**: Tests in their own directory
 6. **Easier maintenance**: Related files together

@@ -60,7 +60,7 @@ python main.py --mode train --model EleutherAI/pythia-70m --steps 100
 ## Project Structure
 
 ```
-lisa-autoresearch/
+LISA_FTM/
 ├── federated/
 │   ├── client.py       # FederatedClient: train + exchange gradients
 │   ├── server.py       # FederatedServer: aggregate + distribute
@@ -252,12 +252,14 @@ This makes federated learning suitable for:
 
 ## GitHub
 
-**https://github.com/CiphemonJY/lisa-autoresearch**
+**https://github.com/CiphemonJY/LISA_FTM**
 
 Clone and run:
 ```bash
-git clone https://github.com/CiphemonJY/lisa-autoresearch
-cd lisa-autoresearch
+git clone https://github.com/CiphemonJY/LISA_FTM
+cd LISA_FTM
 pip install torch transformers datasets huggingface_hub
 python main.py --mode simulate
+```
+mode simulate
 ```

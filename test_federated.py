@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive Test Suite for lisa-autoresearch on Windows/CPU
+Comprehensive Test Suite for LISA_FTM on Windows/CPU
 
 Tests:
 1. Environment (torch, transformers, numpy)
@@ -987,7 +987,7 @@ def test_federated_for_any_hardware():
     log("    - Single point of failure")
     log("    - Privacy risk: data leaves users' devices")
     log("")
-    log("  FEDERATED (lisa-autoresearch):")
+    log("  FEDERATED (LISA_FTM):")
     log("    - Data STAYS on client devices")
     log("    - Clients train locally (small compute)")
     log("    - Only gradients exchanged (not data)")

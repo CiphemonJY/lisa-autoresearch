@@ -82,7 +82,7 @@ If you use the combined LISA + Offload approach, please cite:
   title={LISA + AutoResearch: Combined Layer-wise Importance Sampling and Disk Offloading for Large Model Training},
   author={LISA + AutoResearch Contributors},
   year={2024},
-  url={https://github.com/YOUR_USERNAME/lisa-autoresearch},
+  url={https://github.com/CiphemonJY/LISA_FTM},
   note={Novel combination of LISA (Pan et al., 2024) with activation offloading, 
         achieving 5x speedup by only offloading sampled layers}
 }

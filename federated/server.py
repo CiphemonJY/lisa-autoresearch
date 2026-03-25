@@ -53,19 +53,22 @@ try:
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
-    logger.warning("fastapi not installed. HTTP API disabled. Use --demo mode.")
+    logging.getLogger("fed-server").warning("fastapi not installed. HTTP API disabled. Use --demo mode.")
 
 # Configure logging — UTF-8 file handler for /tmp/server.log + UTF-8 stdout
 _log_handler = logging.StreamHandler(sys.stdout)
 _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
 if hasattr(_log_handler, "setEncoding"):
     _log_handler.setEncoding("utf-8")
-_log_file_handler = logging.FileHandler("/tmp/server.log", encoding="utf-8", mode="a")
-_log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+try:
+    _log_file_handler = logging.FileHandler("/workspace/logs/server.log", encoding="utf-8", mode="a")
+    _log_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s"))
+except Exception:
+    _log_file_handler = None  # Container may not have write access
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
-    handlers=[_log_handler, _log_file_handler],
+    handlers=[_log_handler] + ([_log_file_handler] if _log_file_handler else []),
 )
 logger = logging.getLogger("fed-server")
 

@@ -479,6 +479,13 @@ class FederatedServer:
             if latest_id is None:
                 self._save_model(0)
 
+            # BUG FIX: Apply LoRA so gradient keys match clients
+            # Without this, server's base model (291 keys) ignores client gradients (lora_A/lora_B keys)
+            from federated.client import apply_lora_to_model
+            lora_count = apply_lora_to_model(self.model, rank=4, alpha=8.0, dropout=0.05)
+            logger.info(f"LoRA applied to {lora_count} layers (rank=4)")
+
+
             logger.info(f"Model loaded: {sum(p.numel() for p in self.model.parameters()):,} params")
 
         except Exception as e:
@@ -1529,7 +1536,7 @@ class DemoFederatedSimulator:
         from federated.client import FederatedClient
         client = FederatedClient(
             client_id=client_id,
-            server_url="http://localhost:8000",  # Won't be used in demo
+            server_instance=self.server,  # Direct call (bypass HTTP)
             config=self.server.config,
         )
         self.clients[client_id] = client
@@ -1548,7 +1555,6 @@ class DemoFederatedSimulator:
             update = client.train_and_submit(round_num)
 
             # Server receives gradient
-            self.server.receive_gradient(update)
 
         # Aggregation happens automatically when min clients submit
         rs = self.server.round_state.get(round_num)

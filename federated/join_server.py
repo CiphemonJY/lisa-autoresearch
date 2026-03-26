@@ -208,6 +208,22 @@ class FederatedServer:
             "gradients_received": len(self.rounds[round_number].gradients)
         }
     
+    def start_round(self, round_num):
+        """Start a new training round."""
+        with self.lock:
+            if round_num not in self.rounds:
+                self.rounds[round_num] = RoundState(round_num)
+            self.rounds[round_num].status = "waiting"
+        return {"status": "started", "round": round_num}
+    
+    def get_round_status(self, round_num):
+        """Get status of a specific round."""
+        with self.lock:
+            if round_num in self.rounds:
+                rs = self.rounds[round_num]
+                return {"status": rs.status, "round": round_num, "gradients": len(rs.gradients)}
+        return {"status": "not_started", "round": round_num, "gradients": 0}
+    
     def _aggregate(self, round_num):
         time.sleep(2)
         
@@ -396,6 +412,16 @@ async def health():
 @app.post("/submit")
 async def submit(data: dict):
     return server.receive_gradient(data)
+
+@app.post("/start_round/{round_num}")
+async def start_round(round_num: int):
+    """Start a new training round."""
+    return server.start_round(round_num)
+
+@app.get("/round/{round_num}")
+async def get_round(round_num: int):
+    """Get status of a specific round."""
+    return server.get_round_status(round_num)
 
 @app.get("/status")
 async def status():

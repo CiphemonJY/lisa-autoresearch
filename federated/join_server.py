@@ -188,6 +188,7 @@ class FederatedServer:
         logger.info("Model loaded with LoRA")
         
         self.rounds: Dict[int, RoundState] = {}
+        self.slots: Dict[int, Dict] = {}  # round_num -> {slot_id -> {status, client_id, gradient}}
         self.lock = threading.Lock()
         self.stats = {"total_gradients": 0, "total_clients": set()}
         
@@ -223,6 +224,154 @@ class FederatedServer:
                 rs = self.rounds[round_num]
                 return {"status": rs.status, "round": round_num, "gradients": len(rs.gradients)}
         return {"status": "not_started", "round": round_num, "gradients": 0}
+    
+    # ============ Work Slot System ============
+    def create_slots(self, round_num, num_slots):
+        """Create work slots for a round."""
+        with self.lock:
+            if round_num not in self.slots:
+                self.slots[round_num] = {}
+            for i in range(num_slots):
+                if i not in self.slots[round_num]:
+                    self.slots[round_num][i] = {
+                        "status": "available",
+                        "client_id": None,
+                        "gradient": None,
+                        "created_at": time.time()
+                    }
+        logger.info(f"Created {num_slots} slots for round {round_num}")
+        return {"status": "ok", "round": round_num, "slots": num_slots}
+    
+    def claim_slot(self, client_id):
+        """Claim an available work slot."""
+        with self.lock:
+            # Find first available slot across rounds
+            for rn in sorted(self.slots.keys()):
+                for sid, slot in self.slots[rn].items():
+                    if slot["status"] == "available":
+                        slot["status"] = "in_progress"
+                        slot["client_id"] = client_id
+                        slot["created_at"] = time.time()
+                        logger.info(f"Slot {rn}_{sid} claimed by {client_id}")
+                        return {"status": "ok", "round": rn, "slot": sid}
+            
+            # No slots available - create new round
+            new_round = max(self.slots.keys()) + 1 if self.slots else 1
+            self.create_slots(new_round, 3)  # 3 clients per round
+            
+            # Try to claim again
+            if 1 in self.slots and 0 in self.slots[1]:
+                slot = self.slots[1][0]
+                slot["status"] = "in_progress"
+                slot["client_id"] = client_id
+                slot["created_at"] = time.time()
+                return {"status": "ok", "round": 1, "slot": 0}
+            
+            return {"status": "no_slots", "message": "No slots available"}
+    
+    def release_slot(self, client_id, key):
+        """Release a held slot."""
+        with self.lock:
+            try:
+                parts = key.split("_")
+                rn, sid = int(parts[0]), int(parts[1])
+                if rn in self.slots and sid in self.slots[rn]:
+                    slot = self.slots[rn][sid]
+                    if slot["client_id"] == client_id and slot["status"] == "in_progress":
+                        slot["status"] = "available"
+                        slot["client_id"] = None
+                        logger.info(f"Slot {key} released by {client_id}")
+                        return {"status": "ok"}
+            except:
+                pass
+            return {"status": "error", "message": "Slot not found or not held by client"}
+    
+    def submit_slot_result(self, data):
+        """Submit gradient for a slot."""
+        client_id = data.get("client_id", "unknown")
+        round_num = data.get("round")
+        slot_id = data.get("slot")
+        gradient = data.get("gradient")
+        loss = data.get("loss", 0)
+        
+        if gradient is None:
+            return {"status": "error", "message": "No gradient provided"}
+        
+        with self.lock:
+            if round_num not in self.slots or slot_id not in self.slots[round_num]:
+                return {"status": "error", "message": "Slot not found"}
+            
+            slot = self.slots[round_num][slot_id]
+            if slot["client_id"] != client_id:
+                return {"status": "error", "message": "Slot held by different client"}
+            
+            slot["status"] = "complete"
+            slot["gradient"] = gradient
+            slot["loss"] = loss
+            
+            # Count completed
+            completed = sum(1 for s in self.slots[round_num].values() if s["status"] == "complete")
+            total = len(self.slots[round_num])
+            
+            logger.info(f"Slot {round_num}_{slot_id} complete by {client_id} (loss={loss:.4f})")
+            
+            # If all slots complete, aggregate
+            if completed == total:
+                self._aggregate_from_slots(round_num)
+            
+            return {"status": "submitted", "round": round_num, "slot": slot_id, "completed": completed, "total": total}
+    
+    def _aggregate_from_slots(self, round_num):
+        """Aggregate gradients from completed slots."""
+        if round_num not in self.slots:
+            return
+        
+        gradients = []
+        for slot in self.slots[round_num].values():
+            if slot["status"] == "complete" and slot["gradient"] is not None:
+                gradients.append(slot["gradient"])
+        
+        if not gradients:
+            return
+        
+        logger.info(f"Aggregating round {round_num} with {len(gradients)} gradients")
+        
+        all_keys = set()
+        for g in gradients:
+            all_keys.update(g.keys())
+        
+        aggregated = {}
+        for key in all_keys:
+            grads = []
+            for g in gradients:
+                if key in g:
+                    grad = g[key]
+                    if isinstance(grad, np.ndarray):
+                        grad = torch.from_numpy(grad)
+                    elif not isinstance(grad, torch.Tensor):
+                        grad = torch.from_numpy(np.array(grad))
+                    grads.append(grad.float())
+            
+            if grads:
+                aggregated[key] = torch.stack(grads).mean(0)
+        
+        # Apply to model
+        model_state = self.model.state_dict()
+        for key, grad in aggregated.items():
+            if key in model_state:
+                param = model_state[key]
+                if isinstance(param, np.ndarray):
+                    param = torch.from_numpy(param)
+                elif not isinstance(param, torch.Tensor):
+                    param = torch.from_numpy(np.array(param))
+                model_state[key] = param.float() + self.lr * grad.float()
+        
+        self.model.load_state_dict(model_state)
+        
+        # Save checkpoint
+        self._save_checkpoint(round_num)
+        
+        logger.info(f"Round {round_num} aggregation complete")
     
     def _aggregate(self, round_num):
         time.sleep(2)
@@ -417,6 +566,34 @@ async def submit(data: dict):
 async def start_round(round_num: int):
     """Start a new training round."""
     return server.start_round(round_num)
+
+@app.post("/round/{round_num}/slots/{num_slots}")
+async def create_slots(round_num: int, num_slots: int):
+    """Create work slots for a round."""
+    return server.create_slots(round_num, num_slots)
+
+@app.post("/slot/claim")
+async def claim_slot(data: dict):
+    """Claim an available work slot."""
+    client_id = data.get("client_id", "unknown")
+    return server.claim_slot(client_id)
+
+@app.post("/slot/submit")
+async def submit_slot(data: dict):
+    """Submit work result for a slot."""
+    return server.submit_slot_result(data)
+
+@app.post("/slot/release")
+async def release_slot(data: dict):
+    """Release a slot (on failure)."""
+    client_id = data.get("client_id", "")
+    key = data.get("key", "")
+    return server.release_slot(client_id, key)
+
+@app.get("/client/register")
+async def register_client(client_id: str = None):
+    """Register a client as available."""
+    return {"status": "ok", "client_id": client_id}
 
 @app.get("/round/{round_num}")
 async def get_round(round_num: int):

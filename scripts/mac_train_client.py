@@ -217,6 +217,22 @@ def main():
         except:
             pass
         
+        # Auto-retry on failure - wait for completion or timeout
+        retry_count = 0
+        while retry_count < 3:
+            try:
+                r = requests.get(f"{SERVER_URL}/status", timeout=5)
+                st = r.json()
+                if str(round_num) in st.get("rounds", {}) and st["rounds"][str(round_num)]["status"] != "complete":
+                    retry_count += 1
+                    log(f"  ⏳ Round not complete, retry {retry_count}/3...")
+                    time.sleep(30)
+                else:
+                    break
+            except:
+                retry_count += 1
+                time.sleep(10)
+        
         round_num += 1
         
         # Evaluate every 5 rounds

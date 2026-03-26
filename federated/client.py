@@ -582,6 +582,7 @@ class LocalTrainer:
         return enc
     
     def compute_gradient_update(self, round_number: int) -> GradientUpdate:
+        logger.debug(f"compute_gradient_update called for round {round_number}")
         """
         Train locally and compute a gradient update.
         
@@ -633,10 +634,13 @@ class LocalTrainer:
                 loss.backward()
                 
                 # Clip gradients
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    self.config["gradient_clip_norm"],
-                )
+                # Collect gradients BEFORE optimizer.step() (step clears grads)
+                captured_grads = {}
+                for cap_name, cap_param in self.model.named_parameters():
+                    if cap_param.requires_grad and cap_param.grad is not None:
+                        captured_grads[cap_name] = cap_param.grad.detach().clone()
+                
+                # Now step (this zeroes grads but we already captured them)
                 optimizer.step()
                 
                 total_loss += loss.item()
@@ -650,14 +654,22 @@ class LocalTrainer:
         
         avg_loss = total_loss / max(num_steps, 1)
         
-        # Get gradient (difference from initial model)
+        # Use CAPTURED gradients (optimizer.step() cleared the live grads)
         state_dict = {}
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                state_dict[name] = param.grad.detach().cpu().numpy().astype(np.float32)
+        for name in captured_grads:
+            state_dict[name] = captured_grads[name].cpu().numpy().astype(np.float32)
         
         # Apply differential privacy
         state_dict, noise_seed = self.privacy.apply(state_dict)
+
+        # DEBUG: Log gradient stats
+        if state_dict:
+            flat = np.concatenate([v.flatten() for v in state_dict.values()])
+            debug_norm = float(np.linalg.norm(flat))
+            debug_count = sum(1 for v in state_dict.values() if np.linalg.norm(v.flatten()) > 1e-10)
+            logger.debug(f"Captured {len(state_dict)} tensors, {debug_count} non-zero, norm={debug_norm:.8f}")
+        else:
+            logger.warning(f"state_dict is EMPTY in gradient computation!")
         
         # Compute gradient norm
         flat_grad = np.concatenate([v.flatten() for v in state_dict.values()])
@@ -701,11 +713,14 @@ class FederatedClient:
                  config: Optional[Dict] = None,
                  p2p_enabled: bool = False,
                  bootstrap_server: Optional[str] = None,
-                 auth_token: Optional[str] = None):
+                 auth_token: Optional[str] = None,
+                 server_instance=None):
         self.client_id = client_id
         self.server_url = server_url.rstrip("/")
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.auth_token = auth_token
+        self.server_instance = server_instance  # Direct ref to server (bypass HTTP)
+        self.server_instance = server_instance  # Direct ref to server (bypass HTTP)
 
         self.state = ClientState(client_id=client_id)
         self.trainer = LocalTrainer(client_id, self.config)
@@ -791,7 +806,7 @@ class FederatedClient:
                         loss_after=update.loss_after,
                     )
         
-        # Submit to server
+        # Submit to server: use direct function call to bypass HTTP
         try:
             import base64
 
@@ -809,40 +824,40 @@ class FederatedClient:
                 "dp_epsilon": update.dp_epsilon,
                 "gradient_data": base64.b64encode(update.compressed_data).decode("utf-8"),
             }
-
-            headers = {}
-            if self.auth_token:
-                headers["Authorization"] = f"Bearer {self.auth_token}"
-
-            # Send metadata first
-            meta_resp = requests.post(
-                f"{self.server_url}/submit",
-                json=payload,
-                timeout=30,
-                headers=headers,
+            
+            logger.info(
+                f"Round {rn}: Submitting gradient "
+                f"(client_id={update.client_id}, norm={update.gradient_norm:.4f}, "
+                f"size={len(update.compressed_data):,} bytes, loss={update.loss_after:.4f})"
             )
             
-            if meta_resp.status_code == 200:
-                logger.info(
-                    f"Round {rn}: Gradient submitted "
-                    f"(norm={update.gradient_norm:.4f}, "
-                    f"size={len(update.compressed_data):,} bytes, "
-                    f"loss={update.loss_after:.4f})"
-                )
-                
-                self.state.round_number = rn
-                self.state.local_epochs_completed += self.config["local_epochs"]
-                self.state.total_samples_trained += update.num_samples
-                self.state.last_submit_time = time.time()
-                
-                return update  # Return the GradientUpdate object
+            # Try direct server call first (same process)
+            if self.server_instance is not None:
+                result = self.server_instance.receive_gradient(payload)
+                logger.info(f"Round {rn}: Server accepted gradient directly")
             else:
-                logger.error(f"Server rejected: {meta_resp.status_code} {meta_resp.text}")
-                return {"status": "error", "message": meta_resp.text}
-                
-        except requests.exceptions.ConnectionError:
-            logger.warning(f"Server not reachable at {self.server_url}")
-            return {"status": "error", "message": "server_unreachable"}
+                # Fall back to HTTP POST
+                headers = {}
+                if self.auth_token:
+                    headers["Authorization"] = f"Bearer {self.auth_token}"
+                meta_resp = requests.post(
+                    f"{self.server_url}/submit",
+                    json=payload,
+                    timeout=30,
+                    headers=headers,
+                )
+                if meta_resp.status_code != 200:
+                    logger.error(f"Server rejected: {meta_resp.status_code} {meta_resp.text}")
+                    return {"status": "error", "message": meta_resp.text}
+                logger.info(f"Round {rn}: Gradient submitted via HTTP")
+            
+            self.state.round_number = rn
+            self.state.local_epochs_completed += self.config["local_epochs"]
+            self.state.total_samples_trained += update.num_samples
+            self.state.last_submit_time = time.time()
+            
+            return update
+
         except Exception as e:
             logger.error(f"Submit failed: {e}")
             return {"status": "error", "message": str(e)}

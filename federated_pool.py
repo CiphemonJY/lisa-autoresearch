@@ -14,7 +14,7 @@ It does NOT run on the client devices — those run federated_lisa.py.
 Usage:
     # As a library
     from federated_pool import FederatedPool
-    pool = FederatedPool("http://10.0.0.43:8080", "MY_API_KEY")
+    pool = FederatedPool("http://SERVER_IP:8080", "MY_API_KEY")
     pool.discover_devices()
     pool.assign_layers()
     pool.run_round()
@@ -235,7 +235,7 @@ class FederatedPool:
                  round_timeout: int = 300):
         """
         Args:
-            server_url: Base URL of the federated HTTP server (e.g. "http://10.0.0.43:8080")
+            server_url: Base URL of the federated HTTP server (e.g. "http://SERVER_IP:8080")
             pool_api_key: API key for authenticating with the server
             model_name: HuggingFace model name (for layer count)
             total_layers: Total number of transformer layers in the model
@@ -698,7 +698,7 @@ class FederatedPool:
 
 def main():
     parser = argparse.ArgumentParser(description="FederatedPool — LISA Server Coordinator")
-    parser.add_argument("--server", required=True, help="Federated server URL (e.g. http://10.0.0.43:8080)")
+    parser.add_argument("--server", required=True, help="Federated server URL (e.g. http://SERVER_IP:8080)")
     parser.add_argument("--api-key", required=True, help="Server API key")
     parser.add_argument("--model", default="microsoft/phi-2", help="Model name for layer detection")
     parser.add_argument("--rounds", type=int, default=10, help="Number of federated rounds")

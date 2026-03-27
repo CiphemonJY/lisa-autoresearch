@@ -7,7 +7,7 @@ Connects to a federated server, receives global model updates,
 trains only assigned LISA layers locally, and sends gradients back.
 
 Usage:
-    python federated_lisa.py --server 10.0.0.145:8080 --model Qwen/Qwen2.5-7B \\
+    python federated_lisa.py --server SERVER_IP:8080 --model Qwen/Qwen2.5-7B \\
         --device mlx --layers 0,1,2,3,4,5,6,7,8 --api-key KEY --rounds 10
 """
 

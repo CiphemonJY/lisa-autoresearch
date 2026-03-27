@@ -14,7 +14,7 @@ ROOT = Path(__file__).parent
 def get_server_status():
     try:
         import requests
-        r = requests.get("http://10.0.0.145:8080/status", timeout=3)
+        r = requests.get("http://SERVER_IP:8080/status", timeout=3)
         return r.json()
     except Exception:
         return {"error": "Server unreachable"}
@@ -53,7 +53,7 @@ def server_start(port=8080):
     return f"Server starting in background...\n{out[:500]}"
 
 def server_stop():
-    out = run_cmd("curl -s -X POST http://10.0.0.145:8080/shutdown", timeout=5)
+    out = run_cmd("curl -s -X POST http://SERVER_IP:8080/shutdown", timeout=5)
     return f"Shutdown signal sent.\n{out[:200]}"
 
 # ── Tab 2: Clients ────────────────────────────────────────────────────────
@@ -290,7 +290,7 @@ with gr.Blocks(css=css, title="LISA_FTM Dashboard") as dashboard:
             with gr.Row():
                 with gr.Column():
                     client_id = gr.Textbox(label="Client ID", value="client-1")
-                    server_url = gr.Textbox(label="Server URL", value="http://10.0.0.145:8080")
+                    server_url = gr.Textbox(label="Server URL", value="http://SERVER_IP:8080")
                     gr.Button("🚀 Connect Client", variant="primary").click(
                         fn=client_connect,
                         inputs=[client_id, server_url],

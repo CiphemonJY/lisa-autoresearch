@@ -4,17 +4,17 @@
 #
 # Usage:
 #   # On Mac Mini (MLX):
-#   bash start_federated.sh --role client --server 10.0.0.145:8080 \
+#   bash start_federated.sh --role client --server SERVER_IP:8080 \
 #     --model Qwen/Qwen2.5-7B --device mlx --layers 0,1,2,3,4,5,6,7,8 \
 #     --api-key YOUR_KEY --rounds 10
 #
 #   # On Jetson (CUDA):
-#   bash start_federated.sh --role client --server 10.0.0.43:8080 \
+#   bash start_federated.sh --role client --server SERVER_IP:8080 \
 #     --model Qwen/Qwen2.5-3B --device cuda --layers 20,21,22,23,24,25,26,27 \
 #     --api-key YOUR_KEY --rounds 10
 #
 #   # As pool coordinator (server-side, on Jetson or head node):
-#   bash start_federated.sh --role pool --server http://10.0.0.43:8080 \
+#   bash start_federated.sh --role pool --server http://SERVER_IP:8080 \
 #     --api-key YOUR_KEY --rounds 10
 #
 # Requirements:

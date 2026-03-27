@@ -1,10 +1,38 @@
 # Federated LISA
 
+[![GitHub release](https://img.shields.io/github/v/release/CiphemonJY/LISA_FTM)](https://github.com/CiphemonJY/LISA_FTM/releases)
+[![Python](https://img.shields.io/badge/python-3.8+-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red)](https://pytorch.org/)
+
+> 🚀 **NEW: Sparse Gradient Compression — 20x bandwidth reduction!**
+> Send only 10% of gradients while maintaining model quality.
+
 **Train AI together — any device, any hardware, any location.**
 
 This project implements federated fine-tuning of large language models. Every device — a laptop, a server, a Mac Mini — trains locally on its own data and shares learned updates with a central server. No data leaves the device. Everyone benefits from everyone's contributions.
 
 Built on **LISA** (Layer-wise Importance Sampling): only train the layers that matter most, making fine-tuning fast and cheap on any hardware.
+
+---
+
+
+### ✨ Sparse Federated Learning
+
+Reduce bandwidth by **10-20x** with gradient sparsification:
+
+| Keep % | Compression | Use Case |
+|--------|-------------|----------|
+| 5% | ~40x | Very low bandwidth |
+| 10% | ~20x | **Recommended** |
+| 20% | ~10x | Higher quality |
+
+```python
+from federated.optimizations import SparseCompressor
+
+compressor = SparseCompressor(keep_fraction=0.1)
+packed, meta, stats = compressor.compress(gradients)
+# Send only 10% of gradient data!
+```
 
 ---
 

@@ -260,6 +260,7 @@ class LISATrainer:
         
         # Load model layers
         self.layer_model.load_model_layers()
+        self.device = DEVICE
         
         # Training state
         self.current_layer = 0

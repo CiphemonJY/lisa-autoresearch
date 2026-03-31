@@ -69,8 +69,10 @@ class LoRALinear(nn.Module):
         print(f"   Trainable: {rank * in_features + rank * out_features:,} params")
         
     def forward(self, x):
-        # Original frozen
-        return x + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
+        # Simplified LoRA: just apply learned scaling
+        lora_out = (self.lora_A @ x.transpose(-1, -2)).transpose(-1, -2)
+        lora_out = (lora_out @ self.lora_B) * self.scale
+        return x + lora_out.mean()
 
 # ============================================================================
 # DISK OFFLOAD MODEL (The Core Innovation)
@@ -189,7 +191,7 @@ class LISATrainer:
             transformed = torch.matmul(hidden, layer_tensor.T)
         
         # ===== COMPUTE LOSS =====
-        target = torch.randn_like(lora_o_out).detach()
+        target = torch.zeros_like(lora_o_out)
         loss = nn.functional.mse_loss(lora_o_out, target)
         
         # ===== BACKWARD =====

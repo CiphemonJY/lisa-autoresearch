@@ -62,8 +62,8 @@ class LoRALinear(nn.Module):
         self.scale = alpha / rank
         
         # LoRA parameters
-        self.lora_A = nn.Parameter(torch.randn(rank, in_features) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.lora_A = nn.Parameter(torch.randn(rank, in_features, device=DEVICE, dtype=torch.float16) * 0.01)
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, device=DEVICE, dtype=torch.float16))
         
         print(f"   LoRA: {in_features} → {out_features}")
         print(f"   Trainable: {rank * in_features + rank * out_features:,} params")

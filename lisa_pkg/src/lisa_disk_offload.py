@@ -143,8 +143,10 @@ class LISATrainer:
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
-            [self.lora_q.parameters(), self.lora_k.parameters(),
-             self.lora_v.parameters(), self.lora_o.parameters()],
+            list(self.lora_q.parameters()) + 
+            list(self.lora_k.parameters()) +
+            list(self.lora_v.parameters()) +
+            list(self.lora_o.parameters()),
             lr=1e-4
         )
         

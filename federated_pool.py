@@ -278,7 +278,7 @@ class FederatedPool:
 
         Args:
             timeout: Seconds to wait for discovery probe
-            lan_subnet: Subnet to scan (e.g. "10.0.0.") — if None, uses server's subnet
+            lan_subnet: Subnet to scan (e.g. "192.168.1.") — if None, uses server's subnet
 
         Returns:
             List of discovered DeviceInfo objects

@@ -2,6 +2,19 @@
 
 *Based on Gemini's engineering suggestions - 2026-04-02*
 
+## Hardware Reality Check
+
+**Bandwidth Math:**
+| Component | Bandwidth | Notes |
+|----------|-----------|-------|
+| Unified RAM (Jetson) | ~68 GB/s | LPDDR5 |
+| NVMe SSD via PCIe | ~3-4 GB/s | Theoretical max |
+| **Ratio** | **~20x slower** | Every layer swap hits this wall |
+
+**Implication:** Layer swapping is inevitable, but we can minimize its impact.
+
+---
+
 ## 1. I/O Bottleneck: Layer Prefetching
 
 **Problem:** Layer-by-layer processing stalls while loading from storage.
@@ -47,6 +60,122 @@ for batch in dataloader:
 ```
 
 **Benefit:** Hide I/O latency behind computation
+
+---
+
+## 1b. Zero-Copy Loading (Safetensors + mmap)
+
+**Problem:** PyTorch `.pt` files copy data during load, wasting RAM.
+
+**Solution:** Use Safetensors with memory-mapping (mmap) - OS streams directly from SSD.
+
+```python
+from safetensors import safe_open
+from safetensors.torch import save_file
+import torch
+
+def save_layer_safetensors(layer, layer_idx, path="/tmp/layers"):
+    """Save layer weights in safetensors format for mmap loading"""
+    state_dict = {f"layer_{layer_idx}": layer.weight}
+    save_file(state_dict, f"{path}/layer_{layer_idx}.safetensors")
+
+def load_layer_mmap(layer_idx, path="/tmp/layers"):
+    """Memory-map layer directly from SSD - no RAM allocation"""
+    with safe_open(f"{path}/layer_{layer_idx}.safetensors", 
+                   framework="pt", device="cpu") as f:
+        tensor = f.get_tensor(f"layer_{layer_idx}")
+    return tensor
+
+# Memory-map comparison:
+# torch.load(): ~1.5GB peak RAM during load (full file in memory)
+# mmap: ~0MB peak RAM (OS streams directly)
+```
+
+**Benefit:** ~20-30% faster loading, zero extra RAM allocation
+
+---
+
+## 1c. Double Buffering (Compute + I/O Overlap)
+
+**Goal:** Hide disk latency completely by overlapping compute and I/O.
+
+```python
+import asyncio
+import threading
+from queue import Queue
+
+class DoubleBufferLoader:
+    """Load next layer while current layer computes"""
+    
+    def __init__(self, storage_path):
+        self.storage_path = storage_path
+        self.buffer_a = [None, None]  # (layer_idx, weights)
+        self.buffer_b = [None, None]
+        self.active_buffer = 0  # 0 or 1
+        
+    def _load_to_buffer(self, buffer_idx, layer_idx):
+        """Background thread loads layer to specific buffer"""
+        weights = load_layer_mmap(layer_idx)
+        self._buffers[buffer_idx] = [layer_idx, weights]
+        
+    def start_prefetch(self, next_layer_idx):
+        """Start loading next layer in background"""
+        inactive = 1 - self.active_buffer
+        self._load_thread = threading.Thread(
+            target=self._load_to_buffer,
+            args=(inactive, next_layer_idx)
+        )
+        self._load_thread.start()
+        
+    def swap_buffers(self):
+        """Swap to newly loaded buffer"""
+        self.active_buffer = 1 - self.active_buffer
+        layer_idx, weights = self._buffers[self.active_buffer]
+        return layer_idx, weights
+
+# Training loop with double buffering:
+loader = DoubleBufferLoader("/tmp/layers")
+
+for batch_idx, batch in enumerate(dataloader):
+    # Start prefetching layer N+1 while N computes
+    if batch_idx < len(layers) - 1:
+        loader.start_prefetch(batch_idx + 1)
+    
+    # Get current layer (from previous prefetch)
+    layer_idx, weights = loader.swap_buffers()
+    
+    # Compute (should overlap with N+1 loading)
+    output = compute_layer(hidden_states, weights)
+```
+
+**Benefit:** If compute_time ≈ load_time, zero latency overhead
+
+---
+
+## 1d. Hardware Check
+
+**Critical:** Ensure layers are on NVMe, NOT microSD or USB.
+
+```bash
+# Check where swap/storage is located
+df -h /tmp
+lsblk
+# Look for: nvme0n1 (NVMe) vs sda (SATA/USB)
+
+# Test read speed
+sudo hdparm -Tt /dev/nvme0n1p1
+# Should see: > 2000 MB/s for good NVMe
+```
+
+**Jetson Orin Nano storage options:**
+| Storage | Read Speed | Viability |
+|---------|-----------|-----------|
+| microSD | ~100 MB/s | ❌ Too slow |
+| USB 3.0 | ~400 MB/s | ⚠️ Marginal |
+| eMMC | ~300 MB/s | ⚠️ Marginal |
+| NVMe M.2 | ~3000 MB/s | ✅ Required |
+
+**Recommendation:** Use NVMe for layer storage if possible.
 
 ---
 
@@ -132,9 +261,60 @@ class MemoryProfiler:
 
 ## 3. NF4 Quantization Integration
 
-**Problem:** Frozen base weights still consume significant RAM.
+**Problem:** Frozen base weights still consume significant RAM AND slow down I/O.
 
-**Solution:** Use bitsandbytes NF4 for frozen base, keep LoRA in fp16.
+**Solution:** Use bitsandbytes NF4 for frozen base - both memory AND speed improvement.
+
+**Speed benefit:** Smaller files = faster disk transfers
+- Unquantized 1.5B layer: ~3GB → ~1 second to load
+- NF4 1.5B layer: ~0.85GB → ~0.25 second to load
+
+```python
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+def load_quantized_base_model(model_name: str, lora_config: LoraConfig):
+    """Load base model in 4-bit NF4, add LoRA in fp16
+    
+    Benefits:
+    - Memory: 3GB → 0.85GB for 1.5B model
+    - I/O Speed: 1s → 0.25s per layer load
+    """
+    
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",  # NormalFloat4
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="cpu",
+        trust_remote_code=True,
+    )
+    
+    # Freeze base model completely
+    for param in base_model.parameters():
+        param.requires_grad = False
+        
+    model = get_peft_model(base_model, lora_config)
+    
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable: {trainable_params:,} ({100*trainable_params/total_params:.3f}%)")
+    
+    return model
+```
+
+**Memory comparison:**
+| Model | fp16 | NF4+LoRA | Reduction |
+|-------|------|----------|-----------|
+| Qwen 0.5B | 1GB | 0.3GB | 70% |
+| Qwen 1.5B | 3GB | 0.85GB | 72% |
+| Qwen 3B | 6GB | 1.7GB | 72% |
+
+**I/O improvement:** 4x faster layer loads (smaller files)
 
 ```python
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig

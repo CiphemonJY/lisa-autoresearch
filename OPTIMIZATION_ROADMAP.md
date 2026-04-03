@@ -506,3 +506,130 @@ class DistributedLayerClient:
 2. Profile where memory spikes occur
 3. Implement async prefetch for layer loading
 4. Test NF4 on Jetson (if bitsandbytes works on ARM64)
+
+---
+
+## 6. Unified Memory Architecture (UMA) Optimization
+
+**Problem:** PyTorch assumes discrete GPU with PCIe. Orin has CPU+GPU sharing unified RAM.
+
+**Solution:** Use pinned memory and zero-copy to avoid redundant copies.
+
+```python
+import torch
+
+def load_layer_uma(layer_weights, device='cuda'):
+    """Load layer using unified memory - no PCIe copy needed"""
+    
+    # Use pinned memory for zero-copy transfer
+    pinned = layer_weights.pin_memory()
+    
+    # GPU accesses pinned memory directly (no copy)
+    return pinned.to(device, non_blocking=True)
+
+# Alternative: Use gradient checkpointing to recompute instead of storing
+from torch.utils.checkpoint import checkpoint_sequential
+
+# Instead of storing all activations, recompute during backward
+model.layer_blocks = checkpoint_sequential(
+    model.layer_blocks,
+    checkpoint_segments=4  # Recompute every 4 layers
+)
+```
+
+**Note:** On Orin, CUDA can access CPU memory directly. Avoid unnecessary `.to('cuda')`.
+
+---
+
+## 7. Blockwise LoRA (Selective Layer Tuning)
+
+**Insight:** Early layers = grammar, Late layers = reasoning/style.
+
+**Solution:** Only tune final 30% of layers, skip first 70% entirely.
+
+```python
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+
+class BlockwiseLoRA:
+    """Attach LoRA only to final layers"""
+    
+    def __init__(self, model, lora_rank=2, tune_fraction=0.3):
+        self.total_layers = len(model.model.layers)
+        self.tune_layers = int(self.total_layers * tune_fraction)
+        self.skip_layers = self.total_layers - self.tune_layers
+        
+        print(f"Tuning only final {self.tune_layers}/{self.total_layers} layers")
+        print(f"Skipping first {self.skip_layers} layers (frozen)")
+        
+        # Freeze early layers
+        for i in range(self.skip_layers):
+            for param in model.model.layers[i].parameters():
+                param.requires_grad = False
+        
+        # Attach LoRA only to remaining layers
+        lora_config = LoraConfig(r=lora_rank, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
+        model = get_peft_model(model, lora_config)
+        return model
+```
+
+**Benefit:** 2x faster backward pass, 2x less I/O
+
+---
+
+## 8. Power State Verification
+
+**Critical:** Throttling destroys performance silently.
+
+```bash
+# Force MAXN mode (maximum performance)
+sudo nvpmodel -m 0
+
+# Lock clocks at maximum
+sudo jetson_clocks
+
+# Verify frequencies
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+cat /sys/devices/17000000.ga10b/devfreq/17000000.ga10b/cur_freq
+```
+
+**Expected on Orin Nano:**
+- CPU: 2.0+ GHz
+- GPU: 1.0+ GHz
+- EMC: 3.2 GHz
+
+---
+
+## 9. Distributed Layer Streaming (Network as RAM)
+
+**Concept:** Use remote machine's RAM as cache over network.
+
+```python
+import zmq
+import pickle
+
+class DistributedLayerCache:
+    """Stream layers from remote machine's RAM"""
+    
+    def __init__(self, remote_ip, port=5555):
+        self.ctx = zmq.Context()
+        self.sock = self.ctx.socket(zmq.REQ)
+        self.sock.connect(f"tcp://{remote_ip}:{port}")
+        
+    def request_layer(self, layer_idx):
+        self.sock.send(pickle.dumps(layer_idx))
+        return pickle.loads(self.sock.recv())
+
+# Server (on machine with spare RAM)
+class LayerServer:
+    def __init__(self, layers_path, port=5555):
+        self.sock = self.ctx.socket(zmq.REP)
+        self.sock.bind(f"tcp://{port}")
+        self.layers_cache = {}
+        
+    def load_all_to_ram(self, path):
+        for i in range(num_layers):
+            self.layers_cache[i] = torch.load(f"{path}/layer_{i}.pt")
+```
+
+**Benefit:** Parallelize I/O across network + local storage
